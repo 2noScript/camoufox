@@ -1,0 +1,9 @@
+[submodule "camoufox-rs"]
+	path = camoufox-rs
+	url = https://github.com/2noScript/camoufox-rs.git
+[submodule "fpgen-rs"]
+	path = fpgen-rs
+	url = https://github.com/2noScript/fpgen-rs.git
+[submodule "myuri-rs"]
+	path = myuri-rs
+	url = https://github.com/2noScript/myuri-rs.git
