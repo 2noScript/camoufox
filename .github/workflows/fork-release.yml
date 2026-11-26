@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional tag (v<version>-stream.<N>); empty auto-increments
+        description: Optional tag (v<version>-uncamoufox.<N>); empty auto-increments
         required: false
         default: ""
       prerelease:
@@ -82,9 +82,9 @@ jobs:
               tag = os.environ["INPUT_TAG"].strip()
           else:
               tags = subprocess.check_output(["git", "tag", "-l", "v*"], text=True).split()
-              pat = re.compile(rf"^v{re.escape(ver)}-stream\.(\d+)$")
+              pat = re.compile(rf"^v{re.escape(ver)}-uncamoufox\.(\d+)$")
               used = [int(m.group(1)) for t in tags if (m := pat.match(t))]
-              tag = f"v{ver}-stream.{max(used, default=0) + 1}"
+              tag = f"v{ver}-uncamoufox.{max(used, default=0) + 1}"
 
           if not re.match(r"^v[^-]+-[a-z]+\.\d+$", tag):
               raise SystemExit(f"Invalid browser tag {tag!r}; expected v<version>-<prefix>.<n>")
