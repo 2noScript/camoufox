@@ -37,10 +37,23 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
  
  void HeadlessCompositorWidget::SetSnapshotListener(HeadlessWidget::SnapshotListener&& listener) {
    MOZ_ASSERT(NS_IsMainThread());
-@@ -41,6 +58,57 @@
-   return result.forget();
- }
+@@ -34,11 +51,68 @@
  
+ already_AddRefed<gfx::DrawTarget> HeadlessCompositorWidget::StartRemoteDrawingInRegion(
+     const LayoutDeviceIntRegion& aInvalidRegion) {
++  if (!mDrawTarget) {
++    LayoutDeviceIntSize size = GetClientSize();
++    if (!size.IsEmpty()) {
++      UpdateDrawTarget(size);
++    }
++  }
+   if (!mDrawTarget)
+     return nullptr;
+ 
+   RefPtr<gfx::DrawTarget> result = mDrawTarget;
+   return result.forget();
++}
++
 +void HeadlessCompositorWidget::EndRemoteDrawingInRegion(
 +    gfx::DrawTarget* aDrawTarget, const LayoutDeviceIntRegion& aInvalidRegion) {
 +  EmitRawFrameIfReady(false);
@@ -90,12 +103,10 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
 +
 +  mLastRawCaptureTime = now;
 +  server->SubmitSurface(this, dataSurface.get());
-+}
-+
+ }
+ 
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
-   if (RefPtr<CompositorVsyncDispatcher> cvd =
-           mWidget->GetCompositorVsyncDispatcher()) {
-@@ -52,8 +120,14 @@
+@@ -52,8 +126,14 @@
  
  void HeadlessCompositorWidget::NotifyClientSizeChanged(
      const LayoutDeviceIntSize& aClientSize) {
@@ -173,10 +184,62 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
 diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
 --- a/widget/headless/HeadlessWidget.cpp
 +++ b/widget/headless/HeadlessWidget.cpp
-@@ -68,6 +68,22 @@
-   return widget.forget();
- }
+@@ -7,6 +7,7 @@
+ #include "ErrorList.h"
+ #include "HeadlessCompositorWidget.h"
+ #include "HeadlessKeyBindings.h"
++#include "HeadlessStreamServer.h"
+ #include "InputData.h"
+ #include "MouseEvents.h"
+ #include "UnitTransforms.h"
+@@ -55,6 +56,7 @@
+ namespace widget {
  
+ StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sActiveWindows;
++StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sPopupWidgets;
+ 
+ already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
+   if (!sActiveWindows) {
+@@ -66,6 +68,56 @@
+   }
+   RefPtr<HeadlessWidget> widget = sActiveWindows->ElementAt(length - 1);
+   return widget.forget();
++}
++
++/* static */
++already_AddRefed<HeadlessWidget> HeadlessWidget::FindPopupAtPoint(
++    const LayoutDeviceIntPoint& aScreenPt) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!sPopupWidgets) {
++    return nullptr;
++  }
++  for (size_t i = sPopupWidgets->Length(); i > 0; --i) {
++    HeadlessWidget* w = sPopupWidgets->ElementAt(i - 1);
++    if (!w->mDestroyed && w->mVisible && w->mBounds.Contains(aScreenPt)) {
++      RefPtr<HeadlessWidget> ret = w;
++      return ret.forget();
++    }
++  }
++  return nullptr;
++}
++
++/* static */
++void HeadlessWidget::SyncStreamWindowState(HeadlessWidget* aWidget) {
++  if (!aWidget) {
++    return;
++  }
++  HeadlessStreamServer* server = HeadlessStreamServer::Get();
++  if (!server->IsEnabled()) {
++    return;
++  }
++  server->UpdateWindowState(
++      reinterpret_cast<uintptr_t>(aWidget),
++      aWidget->mWindowType == WindowType::Popup,
++      aWidget->mVisible && !aWidget->mDestroyed, aWidget->mBounds.X(),
++      aWidget->mBounds.Y(), aWidget->mBounds.Width(),
++      aWidget->mBounds.Height());
++}
++
 +/* static */
 +already_AddRefed<HeadlessWidget> HeadlessWidget::FindActiveWindow(
 +    uintptr_t aWidgetKey) {
@@ -191,15 +254,74 @@ diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget
 +    }
 +  }
 +  return GetActiveWindow();
-+}
-+
+ }
+ 
  HeadlessWidget::HeadlessWidget()
-     : mEnabled(true),
-       mVisible(false),
+@@ -83,6 +135,10 @@
+     sActiveWindows = new nsTArray<HeadlessWidget*>();
+     ClearOnShutdown(&sActiveWindows);
+   }
++  if (!sPopupWidgets) {
++    sPopupWidgets = new nsTArray<HeadlessWidget*>();
++    ClearOnShutdown(&sPopupWidgets);
++  }
+ }
+ 
+ HeadlessWidget::~HeadlessWidget() {
+@@ -97,6 +153,10 @@
+   }
+   LOG(("HeadlessWidget::Destroy [%p]\n", (void*)this));
+   mDestroyed = true;
++  if (sPopupWidgets) {
++    sPopupWidgets->RemoveElement(this);
++  }
++  SyncStreamWindowState(this);
+ 
+   if (sActiveWindows) {
+     int32_t index = sActiveWindows->IndexOf(this);
+@@ -127,6 +187,7 @@
+   mBounds = aRect;
+   mRestoreBounds = aRect;
+   mAlwaysOnTop = aInitData.mAlwaysOnTop;
++  SyncStreamWindowState(this);
+   return NS_OK;
+ }
+ 
+@@ -167,6 +228,14 @@
+   mVisible = aState;
+ 
+   LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
++
++  if (mWindowType == WindowType::Popup && sPopupWidgets) {
++    sPopupWidgets->RemoveElement(this);
++    if (aState && !mDestroyed) {
++      sPopupWidgets->AppendElement(this);
++    }
++  }
++  SyncStreamWindowState(this);
+ 
+   // Top-level window and dialogs are activated/raised when shown.
+   // NB: alwaysontop windows are generally used for peripheral indicators.
+@@ -226,6 +295,7 @@
+ 
+   mBounds.MoveTo(aX, aY);
+   NotifyWindowMoved(mBounds.TopLeft());
++  SyncStreamWindowState(this);
+ }
+ 
+ LayoutDeviceIntPoint HeadlessWidget::WidgetToScreenOffset() {
+@@ -264,6 +334,7 @@
+   if (mAttachedWidgetListener) {
+     mAttachedWidgetListener->WindowResized(this, mBounds.Size());
+   }
++  SyncStreamWindowState(this);
+ }
+ 
+ void HeadlessWidget::Resize(const DesktopRect& aRect, bool aRepaint) {
 diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
 --- a/widget/headless/HeadlessWidget.h
 +++ b/widget/headless/HeadlessWidget.h
-@@ -130,6 +130,12 @@
+@@ -130,8 +130,20 @@
    using SnapshotListener = std::function<void(RefPtr<gfx::DataSourceSurface>&&)>;
    void SetSnapshotListener(SnapshotListener&& listener);
  
@@ -207,11 +329,19 @@ diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
 +  // or the top active widget if none matches. Must be called on MainThread.
 +  static already_AddRefed<HeadlessWidget> FindActiveWindow(
 +      uintptr_t aWidgetKey);
++  // Returns the topmost visible Popup widget containing aScreenPt, if any.
++  // Must be called on MainThread.
++  static already_AddRefed<HeadlessWidget> FindPopupAtPoint(
++      const LayoutDeviceIntPoint& aScreenPt);
 +  bool IsDestroyed() const { return mDestroyed; }
 +
   private:
    ~HeadlessWidget();
++  static StaticAutoPtr<nsTArray<HeadlessWidget*>> sPopupWidgets;
++  static void SyncStreamWindowState(HeadlessWidget* aWidget);
    bool mEnabled;
+   bool mVisible;
+   bool mDestroyed;
 diff --git a/widget/headless/moz.build b/widget/headless/moz.build
 --- a/widget/headless/moz.build
 +++ b/widget/headless/moz.build
@@ -239,7 +369,7 @@ diff --git a/widget/headless/HeadlessStreamServer.cpp b/widget/headless/Headless
 new file mode 100644
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.cpp
-@@ -0,0 +1,766 @@
+@@ -0,0 +1,1003 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -263,6 +393,7 @@ new file mode 100644
 +#include "mozilla/TextEvents.h"
 +#include "mozilla/layers/CompositorThread.h"
 +#include "mozilla/widget/IMEData.h"
++#include "nsIRollupListener.h"
 +#include "nsString.h"
 +#include "nsThreadUtils.h"
 +#include "nsXULAppAPI.h"
@@ -384,6 +515,93 @@ new file mode 100644
 +  return 0;
 +}
 +
++bool CheckHeadlessRollup(const LayoutDeviceIntPoint& aScreenPt, bool aIsWheel) {
++  nsIRollupListener* rollupListener = nsIWidget::GetActiveRollupListener();
++  nsCOMPtr<nsIWidget> rollupWidget;
++  if (rollupListener) {
++    rollupWidget = rollupListener->GetRollupWidget();
++  }
++  if (!rollupWidget) {
++    return false;
++  }
++
++  if (rollupWidget->GetBounds().Contains(aScreenPt)) {
++    return false;
++  }
++
++  bool retVal = false;
++  if (aIsWheel) {
++    retVal = rollupListener->ShouldConsumeOnMouseWheelEvent();
++    if (!rollupListener->ShouldRollupOnMouseWheelEvent()) {
++      return retVal;
++    }
++  }
++
++  nsIRollupListener::RollupOptions options;
++  AutoTArray<nsIWidget*, 5> widgetChain;
++  uint32_t sameTypeCount = rollupListener->GetSubmenuWidgetChain(&widgetChain);
++  for (uint32_t i = 0; i < widgetChain.Length(); ++i) {
++    nsIWidget* w = widgetChain[i];
++    if (w && w->GetBounds().Contains(aScreenPt)) {
++      if (i < sameTypeCount) {
++        return retVal;
++      }
++      options.mCount = sameTypeCount;
++      break;
++    }
++  }
++
++  LayoutDeviceIntPoint point = aScreenPt;
++  if (!aIsWheel) {
++    options.mPoint = &point;
++  }
++  if (rollupListener->Rollup(options)) {
++    retVal = true;
++  }
++  return retVal;
++}
++
++void BlendPremulBgra(uint8_t* aDst, int32_t aDstW, int32_t aDstH,
++                     const uint8_t* aSrc, int32_t aSrcW, int32_t aSrcH,
++                     int32_t aOffsetX, int32_t aOffsetY) {
++  const int32_t xStart = std::max<int32_t>(0, aOffsetX);
++  const int32_t yStart = std::max<int32_t>(0, aOffsetY);
++  const int32_t xEnd = std::min<int32_t>(aDstW, aOffsetX + aSrcW);
++  const int32_t yEnd = std::min<int32_t>(aDstH, aOffsetY + aSrcH);
++  if (xStart >= xEnd || yStart >= yEnd) {
++    return;
++  }
++
++  for (int32_t dy = yStart; dy < yEnd; ++dy) {
++    const int32_t sy = dy - aOffsetY;
++    uint8_t* dstRow =
++        aDst + static_cast<size_t>(dy) * aDstW * 4 + static_cast<size_t>(xStart) * 4;
++    const uint8_t* srcRow = aSrc + static_cast<size_t>(sy) * aSrcW * 4 +
++                            static_cast<size_t>(xStart - aOffsetX) * 4;
++    const int32_t count = xEnd - xStart;
++    for (int32_t i = 0; i < count; ++i) {
++      const uint8_t a = srcRow[3];
++      if (a == 255) {
++        dstRow[0] = srcRow[0];
++        dstRow[1] = srcRow[1];
++        dstRow[2] = srcRow[2];
++        dstRow[3] = 255;
++      } else if (a != 0) {
++        const uint32_t invA = 255u - a;
++        dstRow[0] = static_cast<uint8_t>(
++            std::min<uint32_t>(255u, srcRow[0] + (dstRow[0] * invA + 127u) / 255u));
++        dstRow[1] = static_cast<uint8_t>(
++            std::min<uint32_t>(255u, srcRow[1] + (dstRow[1] * invA + 127u) / 255u));
++        dstRow[2] = static_cast<uint8_t>(
++            std::min<uint32_t>(255u, srcRow[2] + (dstRow[2] * invA + 127u) / 255u));
++        dstRow[3] = 255;
++      }
++      dstRow += 4;
++      srcRow += 4;
++    }
++  }
++}
++
 +class StreamKeyListener final : public TextEventDispatcherListener {
 + public:
 +  NS_DECL_ISUPPORTS
@@ -499,6 +717,7 @@ new file mode 100644
 +  }
 +  auto slot = std::make_shared<StreamWidgetSlot>();
 +  slot->widget = aWidget;
++  slot->widgetKey = aWidget->GetWidgetKey();
 +
 +  std::lock_guard<std::mutex> lock(mWidgetsMutex);
 +  mWidgets.push_back(slot);
@@ -510,21 +729,23 @@ new file mode 100644
 +  if (!aSlot) {
 +    return;
 +  }
++  const uintptr_t key = aSlot->widgetKey;
 +  {
 +    std::lock_guard<std::mutex> slotLock(aSlot->mutex);
-+    if (mActiveWidget == aSlot->widget) {
-+      std::lock_guard<std::mutex> listLock(mWidgetsMutex);
-+      if (mActiveWidget == aSlot->widget) {
-+        mActiveWidget = nullptr;
-+        mActiveWidgetKey.store(0, std::memory_order_release);
-+      }
-+    }
 +    aSlot->widget = nullptr;
 +  }
-+
-+  std::lock_guard<std::mutex> listLock(mWidgetsMutex);
-+  mWidgets.erase(std::remove(mWidgets.begin(), mWidgets.end(), aSlot),
-+                 mWidgets.end());
++  {
++    std::lock_guard<std::mutex> listLock(mWidgetsMutex);
++    mWidgets.erase(std::remove(mWidgets.begin(), mWidgets.end(), aSlot),
++                   mWidgets.end());
++  }
++  if (key) {
++    std::lock_guard<std::mutex> compLock(mCompositeMutex);
++    mWindowStates.erase(key);
++    if (mActiveWidgetKey.load(std::memory_order_acquire) == key) {
++      mActiveWidgetKey.store(SelectPrimaryKeyLocked(), std::memory_order_release);
++    }
++  }
 +}
 +
 +void HeadlessStreamServer::UpdateWidgetSize(
@@ -538,75 +759,117 @@ new file mode 100644
 +  aSlot->height = aHeight;
 +}
 +
-+bool HeadlessStreamServer::ShouldAcceptFromWidget(
-+    HeadlessCompositorWidget* aWidget, int32_t aWidth, int32_t aHeight) {
-+  if (aWidth < 2 || aHeight < 2) {
-+    return false;
++void HeadlessStreamServer::UpdateWindowState(uintptr_t aWidgetKey, bool aIsPopup,
++                                             bool aVisible, int32_t aX,
++                                             int32_t aY, int32_t aWidth,
++                                             int32_t aHeight) {
++  if (!mEnabled || !aWidgetKey) {
++    return;
 +  }
-+
-+  std::lock_guard<std::mutex> lock(mWidgetsMutex);
-+  bool hasPrimary = false;
-+  for (const auto& slot : mWidgets) {
-+    if (slot->width >= kPrimaryMinWidth && slot->height >= kPrimaryMinHeight) {
-+      hasPrimary = true;
-+      break;
++  bool shouldRefresh = false;
++  {
++    std::lock_guard<std::mutex> lock(mCompositeMutex);
++    StreamWindowCache& entry = mWindowStates[aWidgetKey];
++    const bool wasVisible = entry.visible;
++    const bool moved = (entry.x != aX || entry.y != aY);
++    entry.isPopup = aIsPopup;
++    entry.visible = aVisible;
++    entry.x = aX;
++    entry.y = aY;
++    entry.width = aWidth;
++    entry.height = aHeight;
++    if (aVisible && (!wasVisible || entry.showSeq == 0)) {
++      entry.showSeq = ++mNextShowSeq;
 +    }
-+  }
-+
-+  // Skip small popup/tooltip widgets when a normal browser window exists.
-+  if (hasPrimary &&
-+      (aWidth < kPrimaryMinWidth || aHeight < kPrimaryMinHeight)) {
-+    return false;
-+  }
-+
-+  if (!mActiveWidget) {
-+    mActiveWidget = aWidget;
-+    mActiveWidgetKey.store(aWidget->GetWidgetKey(), std::memory_order_release);
-+  } else if (mActiveWidget != aWidget) {
-+    bool activeIsTiny = true;
-+    for (const auto& slot : mWidgets) {
-+      if (slot->widget == mActiveWidget) {
-+        activeIsTiny = (slot->width < kPrimaryMinWidth ||
-+                        slot->height < kPrimaryMinHeight);
-+        break;
-+      }
++    if (!aVisible) {
++      std::vector<uint8_t>().swap(entry.cachedBgra);
++      entry.cachedW = 0;
++      entry.cachedH = 0;
 +    }
-+    if (activeIsTiny && aWidth >= kPrimaryMinWidth &&
++    if (aIsPopup && HasClient() && (wasVisible != aVisible || (aVisible && moved))) {
++      shouldRefresh = true;
++    }
++    if (!aIsPopup && aVisible && aWidth >= kPrimaryMinWidth &&
 +        aHeight >= kPrimaryMinHeight) {
-+      mActiveWidget = aWidget;
-+      mActiveWidgetKey.store(aWidget->GetWidgetKey(), std::memory_order_release);
++      mActiveWidgetKey.store(aWidgetKey, std::memory_order_release);
 +    }
 +  }
-+
-+  return mActiveWidget == aWidget;
++  if (shouldRefresh) {
++    RequestCompositeRefresh();
++  }
 +}
 +
-+void HeadlessStreamServer::SubmitSurface(HeadlessCompositorWidget* aWidget,
-+                                         gfx::DataSourceSurface* aSurface) {
-+  if (!mEnabled || !HasClient() || !aSurface) {
++uintptr_t HeadlessStreamServer::SelectPrimaryKeyLocked() const {
++  uintptr_t activeKey = mActiveWidgetKey.load(std::memory_order_acquire);
++  if (activeKey) {
++    auto it = mWindowStates.find(activeKey);
++    if (it != mWindowStates.end() && !it->second.isPopup &&
++        it->second.cachedW >= kPrimaryMinWidth &&
++        it->second.cachedH >= kPrimaryMinHeight &&
++        !it->second.cachedBgra.empty()) {
++      return activeKey;
++    }
++  }
++
++  uintptr_t bestKey = 0;
++  int64_t bestArea = 0;
++  for (const auto& kv : mWindowStates) {
++    const auto& entry = kv.second;
++    if (entry.isPopup || entry.cachedBgra.empty() || entry.cachedW < 2 ||
++        entry.cachedH < 2) {
++      continue;
++    }
++    int64_t area = static_cast<int64_t>(entry.cachedW) * entry.cachedH;
++    if (area > bestArea) {
++      bestArea = area;
++      bestKey = kv.first;
++    }
++  }
++  return bestKey;
++}
++
++void HeadlessStreamServer::EmitCompositeLocked() {
++  uintptr_t primaryKey = SelectPrimaryKeyLocked();
++  if (!primaryKey) {
++    return;
++  }
++  mActiveWidgetKey.store(primaryKey, std::memory_order_release);
++  const StreamWindowCache& primary = mWindowStates.at(primaryKey);
++  if (primary.cachedW < 2 || primary.cachedH < 2 || primary.cachedBgra.empty()) {
 +    return;
 +  }
 +
-+  gfx::SurfaceFormat fmt = aSurface->GetFormat();
-+  if (fmt != gfx::SurfaceFormat::B8G8R8A8 &&
-+      fmt != gfx::SurfaceFormat::B8G8R8X8) {
-+    return;
++  std::vector<const StreamWindowCache*> popups;
++  for (const auto& kv : mWindowStates) {
++    const StreamWindowCache& entry = kv.second;
++    if (entry.isPopup && entry.visible && !entry.cachedBgra.empty() &&
++        entry.cachedW >= 1 && entry.cachedH >= 1) {
++      popups.push_back(&entry);
++    }
 +  }
++  std::sort(popups.begin(), popups.end(),
++            [](const StreamWindowCache* a, const StreamWindowCache* b) {
++              return a->showSeq < b->showSeq;
++            });
 +
-+  gfx::IntSize size = aSurface->GetSize();
-+  if (!ShouldAcceptFromWidget(aWidget, size.width, size.height)) {
-+    return;
-+  }
++  const uint8_t* srcBgra = primary.cachedBgra.data();
++  const int32_t primW = primary.cachedW;
++  const int32_t primH = primary.cachedH;
++  const int32_t primStride = primW * 4;
 +
-+  gfx::DataSourceSurface::ScopedMap map(aSurface,
-+                                        gfx::DataSourceSurface::MapType::READ);
-+  if (!map.IsMapped()) {
-+    return;
++  if (!popups.empty()) {
++    mCompositeScratch = primary.cachedBgra;
++    for (const StreamWindowCache* pop : popups) {
++      BlendPremulBgra(mCompositeScratch.data(), primW, primH,
++                      pop->cachedBgra.data(), pop->cachedW, pop->cachedH,
++                      pop->x - primary.x, pop->y - primary.y);
++    }
++    srcBgra = mCompositeScratch.data();
 +  }
 +
 +  RawStreamPixelFormat outFmt = mFormat;
-+  uint32_t outW = static_cast<uint32_t>(size.width);
-+  uint32_t outH = static_cast<uint32_t>(size.height);
++  uint32_t outW = static_cast<uint32_t>(primW);
++  uint32_t outH = static_cast<uint32_t>(primH);
 +
 +#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 +  outFmt = RawStreamPixelFormat::BGRA;
@@ -637,7 +900,7 @@ new file mode 100644
 +      uint8_t* dstY = mStagingBuffer.data();
 +      uint8_t* dstUV = dstY + static_cast<size_t>(outW) * outH;
 +      int rc = libyuv::ARGBToNV12(
-+          map.GetData(), map.GetStride(), dstY, static_cast<int>(outW), dstUV,
++          srcBgra, primStride, dstY, static_cast<int>(outW), dstUV,
 +          static_cast<int>(outW), static_cast<int>(outW),
 +          static_cast<int>(outH));
 +      if (rc != 0) {
@@ -645,18 +908,7 @@ new file mode 100644
 +      }
 +#endif
 +    } else {
-+      const uint32_t rowBytes = outW * 4;
-+      const int32_t srcStride = map.GetStride();
-+      const uint8_t* src = map.GetData();
-+      uint8_t* dst = mStagingBuffer.data();
-+      if (srcStride == static_cast<int32_t>(rowBytes)) {
-+        std::memcpy(dst, src, payloadSize);
-+      } else {
-+        for (uint32_t y = 0; y < outH; ++y) {
-+          std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
-+                      src + static_cast<size_t>(y) * srcStride, rowBytes);
-+        }
-+      }
++      std::memcpy(mStagingBuffer.data(), srcBgra, payloadSize);
 +    }
 +
 +    mStagingHeader.magic = kStreamMagic;
@@ -669,6 +921,79 @@ new file mode 100644
 +    mHasPendingFrame = true;
 +  }
 +  mFrameCv.notify_one();
++}
++
++void HeadlessStreamServer::SubmitSurface(HeadlessCompositorWidget* aWidget,
++                                         gfx::DataSourceSurface* aSurface) {
++  if (!mEnabled || !HasClient() || !aWidget || !aSurface) {
++    return;
++  }
++
++  gfx::SurfaceFormat fmt = aSurface->GetFormat();
++  if (fmt != gfx::SurfaceFormat::B8G8R8A8 &&
++      fmt != gfx::SurfaceFormat::B8G8R8X8) {
++    return;
++  }
++
++  gfx::IntSize size = aSurface->GetSize();
++  if (size.width < 1 || size.height < 1) {
++    return;
++  }
++
++  gfx::DataSourceSurface::ScopedMap map(aSurface,
++                                        gfx::DataSourceSurface::MapType::READ);
++  if (!map.IsMapped()) {
++    return;
++  }
++
++  const uintptr_t key = aWidget->GetWidgetKey();
++  if (!key) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> compLock(mCompositeMutex);
++  StreamWindowCache& entry = mWindowStates[key];
++  if (entry.isPopup && !entry.visible) {
++    return;
++  }
++
++  const int32_t w = size.width;
++  const int32_t h = size.height;
++  const size_t rowBytes = static_cast<size_t>(w) * 4;
++  const size_t totalBytes = rowBytes * static_cast<size_t>(h);
++  entry.cachedW = w;
++  entry.cachedH = h;
++  entry.cachedBgra.resize(totalBytes);
++
++  const int32_t srcStride = map.GetStride();
++  const uint8_t* src = map.GetData();
++  uint8_t* dst = entry.cachedBgra.data();
++  if (srcStride == static_cast<int32_t>(rowBytes)) {
++    std::memcpy(dst, src, totalBytes);
++  } else {
++    for (int32_t y = 0; y < h; ++y) {
++      std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
++                  src + static_cast<size_t>(y) * srcStride, rowBytes);
++    }
++  }
++
++  EmitCompositeLocked();
++}
++
++void HeadlessStreamServer::RequestCompositeRefresh() {
++  if (!HasClient()) {
++    return;
++  }
++  if (nsCOMPtr<nsIThread> compThread = layers::CompositorThread()) {
++    compThread->Dispatch(NS_NewRunnableFunction(
++        "HeadlessStreamServer::RequestCompositeRefresh", [this]() {
++          if (!HasClient()) {
++            return;
++          }
++          std::lock_guard<std::mutex> compLock(mCompositeMutex);
++          EmitCompositeLocked();
++        }));
++  }
 +}
 +
 +void HeadlessStreamServer::RequestInitialFrames() {
@@ -714,25 +1039,32 @@ new file mode 100644
 +  NS_DispatchToMainThread(NS_NewRunnableFunction(
 +      "HeadlessStreamServer::DispatchInput",
 +      [this, widgetKey, pkt = aPacket, payload = std::move(aPayload)]() {
-+        RefPtr<HeadlessWidget> widget =
++        RefPtr<HeadlessWidget> primary =
 +            HeadlessWidget::FindActiveWindow(widgetKey);
-+        if (!widget || widget->IsDestroyed()) {
++        if (!primary || primary->IsDestroyed()) {
 +          return;
 +        }
 +
 +        const Modifiers mods = ToGeckoModifiers(pkt.modifiers);
-+        const LayoutDeviceIntPoint pt(pkt.x, pkt.y);
++        const LayoutDeviceIntPoint framePt(pkt.x, pkt.y);
++        const LayoutDeviceIntPoint screenPt =
++            primary->GetBounds().TopLeft() + framePt;
 +        const RawInputType type = static_cast<RawInputType>(pkt.type);
 +
 +        switch (type) {
 +          case RawInputType::MouseMove: {
-+            WidgetMouseEvent event(true, eMouseMove, widget.get(),
++            RefPtr<HeadlessWidget> target =
++                HeadlessWidget::FindPopupAtPoint(screenPt);
++            if (!target || target->IsDestroyed()) {
++              target = primary;
++            }
++            WidgetMouseEvent event(true, eMouseMove, target.get(),
 +                                   WidgetMouseEvent::eReal);
-+            event.mRefPoint = pt;
++            event.mRefPoint = screenPt - target->WidgetToScreenOffset();
 +            event.mButtons = mMainInputState.buttons;
 +            event.mModifiers = mods;
 +            event.mTimeStamp = MaskConfig::InputTimeStamp();
-+            widget->DispatchInputEvent(&event);
++            target->DispatchInputEvent(&event);
 +            break;
 +          }
 +          case RawInputType::MouseDown: {
@@ -746,8 +1078,8 @@ new file mode 100644
 +              double dtMs =
 +                  (now - mMainInputState.lastDownTime[idx]).ToMilliseconds();
 +              if (dtMs <= 500.0 &&
-+                  std::abs(pt.x - mMainInputState.lastDownX[idx]) <= 4 &&
-+                  std::abs(pt.y - mMainInputState.lastDownY[idx]) <= 4) {
++                  std::abs(framePt.x - mMainInputState.lastDownX[idx]) <= 4 &&
++                  std::abs(framePt.y - mMainInputState.lastDownY[idx]) <= 4) {
 +                isMulti = true;
 +              }
 +            }
@@ -755,18 +1087,27 @@ new file mode 100644
 +                isMulti ? std::min(mMainInputState.clickCount[idx] + 1u, 3u)
 +                        : 1u;
 +            mMainInputState.lastDownTime[idx] = now;
-+            mMainInputState.lastDownX[idx] = pt.x;
-+            mMainInputState.lastDownY[idx] = pt.y;
++            mMainInputState.lastDownX[idx] = framePt.x;
++            mMainInputState.lastDownY[idx] = framePt.y;
 +
-+            WidgetMouseEvent event(true, eMouseDown, widget.get(),
++            if (CheckHeadlessRollup(screenPt, false)) {
++              break;
++            }
++
++            RefPtr<HeadlessWidget> target =
++                HeadlessWidget::FindPopupAtPoint(screenPt);
++            if (!target || target->IsDestroyed()) {
++              target = primary;
++            }
++            WidgetMouseEvent event(true, eMouseDown, target.get(),
 +                                   WidgetMouseEvent::eReal);
-+            event.mRefPoint = pt;
++            event.mRefPoint = screenPt - target->WidgetToScreenOffset();
 +            event.mButton = btn;
 +            event.mButtons = mMainInputState.buttons;
 +            event.mModifiers = mods;
 +            event.mClickCount = mMainInputState.clickCount[idx];
 +            event.mTimeStamp = MaskConfig::InputTimeStamp();
-+            widget->DispatchInputEvent(&event);
++            target->DispatchInputEvent(&event);
 +            break;
 +          }
 +          case RawInputType::MouseUp: {
@@ -774,30 +1115,46 @@ new file mode 100644
 +            MouseButton btn = ToMouseButton(pkt.button, &idx);
 +            mMainInputState.buttons &= ~MouseButtonsFlagToChange(btn);
 +
-+            WidgetMouseEvent event(true, eMouseUp, widget.get(),
++            RefPtr<HeadlessWidget> target =
++                HeadlessWidget::FindPopupAtPoint(screenPt);
++            if (!target || target->IsDestroyed()) {
++              target = primary;
++            }
++            const LayoutDeviceIntPoint relPt =
++                screenPt - target->WidgetToScreenOffset();
++
++            WidgetMouseEvent event(true, eMouseUp, target.get(),
 +                                   WidgetMouseEvent::eReal);
-+            event.mRefPoint = pt;
++            event.mRefPoint = relPt;
 +            event.mButton = btn;
 +            event.mButtons = mMainInputState.buttons;
 +            event.mModifiers = mods;
 +            event.mClickCount = std::max(1u, mMainInputState.clickCount[idx]);
 +            event.mTimeStamp = MaskConfig::InputTimeStamp();
-+            widget->DispatchInputEvent(&event);
++            target->DispatchInputEvent(&event);
 +
 +            if (btn == MouseButton::eSecondary) {
-+              WidgetPointerEvent ctxEvent(true, eContextMenu, widget.get());
-+              ctxEvent.mRefPoint = pt;
++              WidgetPointerEvent ctxEvent(true, eContextMenu, target.get());
++              ctxEvent.mRefPoint = relPt;
 +              ctxEvent.mButton = MouseButton::eSecondary;
 +              ctxEvent.mButtons = mMainInputState.buttons;
 +              ctxEvent.mModifiers = mods;
 +              ctxEvent.mClickCount = 1;
 +              ctxEvent.mTimeStamp = MaskConfig::InputTimeStamp();
-+              widget->DispatchInputEvent(&ctxEvent);
++              target->DispatchInputEvent(&ctxEvent);
 +            }
 +            break;
 +          }
 +          case RawInputType::Wheel: {
-+            WidgetWheelEvent event(true, eWheel, widget.get());
++            RefPtr<HeadlessWidget> target =
++                HeadlessWidget::FindPopupAtPoint(screenPt);
++            if (!target || target->IsDestroyed()) {
++              if (CheckHeadlessRollup(screenPt, true)) {
++                break;
++              }
++              target = primary;
++            }
++            WidgetWheelEvent event(true, eWheel, target.get());
 +            event.mDeltaMode = 0;  // DOM_DELTA_PIXEL
 +            event.mDeltaX = static_cast<double>(pkt.button);
 +            event.mDeltaY = static_cast<double>(pkt.data);
@@ -808,11 +1165,11 @@ new file mode 100644
 +            event.mWheelTicksX = event.mDeltaX / 120.0;
 +            event.mWheelTicksY = event.mDeltaY / 120.0;
 +            event.mIsNoLineOrPageDelta = false;
-+            event.mRefPoint = pt;
++            event.mRefPoint = screenPt - target->WidgetToScreenOffset();
 +            event.mButtons = mMainInputState.buttons;
 +            event.mModifiers = mods;
 +            event.mTimeStamp = MaskConfig::InputTimeStamp();
-+            widget->DispatchInputEvent(&event);
++            target->DispatchInputEvent(&event);
 +            break;
 +          }
 +          case RawInputType::KeyDown:
@@ -828,7 +1185,7 @@ new file mode 100644
 +            NS_ConvertUTF8toUTF16 codeStr(codeUtf8.c_str(), codeUtf8.size());
 +
 +            WidgetKeyboardEvent event(true, isDown ? eKeyDown : eKeyUp,
-+                                      widget.get());
++                                      primary.get());
 +            event.mTimeStamp = MaskConfig::InputTimeStamp();
 +            event.mModifiers = mods;
 +            event.mIsRepeat = isDown && (pkt.x != 0);
@@ -852,10 +1209,10 @@ new file mode 100644
 +            } else {
 +              event.mKeyCode = FallbackAsciiKeyCode(keyStr);
 +            }
-+            (void)widget->AttachNativeKeyEvent(event);
++            (void)primary->AttachNativeKeyEvent(event);
 +
 +            if (RefPtr<TextEventDispatcher> dispatcher =
-+                    widget->GetTextEventDispatcher()) {
++                    primary->GetTextEventDispatcher()) {
 +              if (NS_SUCCEEDED(
 +                      dispatcher->BeginInputTransaction(GetStreamKeyListener()))) {
 +                nsEventStatus status = nsEventStatus_eIgnore;
@@ -875,7 +1232,7 @@ new file mode 100644
 +            }
 +            NS_ConvertUTF8toUTF16 textStr(payload.c_str(), payload.size());
 +            if (RefPtr<TextEventDispatcher> dispatcher =
-+                    widget->GetTextEventDispatcher()) {
++                    primary->GetTextEventDispatcher()) {
 +              if (NS_SUCCEEDED(
 +                      dispatcher->BeginInputTransaction(GetStreamKeyListener()))) {
 +                nsEventStatus status = nsEventStatus_eIgnore;
@@ -994,10 +1351,20 @@ new file mode 100644
 +    ::close(clientFd);
 +    ResetInputStateOnMainThread();
 +
++    // Release staging & composite buffers when no viewer is connected.
 +    {
 +      std::lock_guard<std::mutex> lock(mFrameMutex);
 +      mHasPendingFrame = false;
 +      std::vector<uint8_t>().swap(mStagingBuffer);
++    }
++    {
++      std::lock_guard<std::mutex> compLock(mCompositeMutex);
++      for (auto& kv : mWindowStates) {
++        std::vector<uint8_t>().swap(kv.second.cachedBgra);
++        kv.second.cachedW = 0;
++        kv.second.cachedH = 0;
++      }
++      std::vector<uint8_t>().swap(mCompositeScratch);
 +    }
 +    std::vector<uint8_t>().swap(mSendBuffer);
 +  }
@@ -1010,7 +1377,7 @@ diff --git a/widget/headless/HeadlessStreamServer.h b/widget/headless/HeadlessSt
 new file mode 100644
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,170 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1025,6 +1392,7 @@ new file mode 100644
 +#include <mutex>
 +#include <string>
 +#include <thread>
++#include <unordered_map>
 +#include <vector>
 +
 +#include "mozilla/TimeStamp.h"
@@ -1079,8 +1447,22 @@ new file mode 100644
 +struct StreamWidgetSlot {
 +  std::mutex mutex;
 +  HeadlessCompositorWidget* widget = nullptr;
++  uintptr_t widgetKey = 0;
 +  int32_t width = 0;
 +  int32_t height = 0;
++};
++
++struct StreamWindowCache {
++  bool isPopup = false;
++  bool visible = false;
++  int32_t x = 0;
++  int32_t y = 0;
++  int32_t width = 0;
++  int32_t height = 0;
++  uint64_t showSeq = 0;
++  int32_t cachedW = 0;
++  int32_t cachedH = 0;
++  std::vector<uint8_t> cachedBgra;
 +};
 +
 +class HeadlessStreamServer final {
@@ -1097,8 +1479,14 @@ new file mode 100644
 +  void UpdateWidgetSize(const std::shared_ptr<StreamWidgetSlot>& aSlot,
 +                        int32_t aWidth, int32_t aHeight);
 +
++  // Called on MainThread when a HeadlessWidget is created/shown/moved/resized/destroyed.
++  void UpdateWindowState(uintptr_t aWidgetKey, bool aIsPopup, bool aVisible,
++                         int32_t aX, int32_t aY, int32_t aWidth,
++                         int32_t aHeight);
++
 +  // Called on CompositorThread right after SWGL finishes drawing a frame.
-+  // Never blocks on socket I/O: overwrites the single latest-frame slot.
++  // Never blocks on socket I/O: composites visible popups and overwrites the
++  // single latest-frame slot.
 +  void SubmitSurface(HeadlessCompositorWidget* aWidget,
 +                     gfx::DataSourceSurface* aSurface);
 +
@@ -1121,8 +1509,9 @@ new file mode 100644
 +                                 std::string aPayload);
 +  void ResetInputStateOnMainThread();
 +  void RequestInitialFrames();
-+  bool ShouldAcceptFromWidget(HeadlessCompositorWidget* aWidget,
-+                              int32_t aWidth, int32_t aHeight);
++  void RequestCompositeRefresh();
++  void EmitCompositeLocked();
++  uintptr_t SelectPrimaryKeyLocked() const;
 +
 +  bool mEnabled = false;
 +  uint32_t mTargetFps = 60;
@@ -1135,8 +1524,12 @@ new file mode 100644
 +
 +  std::mutex mWidgetsMutex;
 +  std::vector<std::shared_ptr<StreamWidgetSlot>> mWidgets;
-+  HeadlessCompositorWidget* mActiveWidget = nullptr;
 +  std::atomic<uintptr_t> mActiveWidgetKey{0};
++
++  std::mutex mCompositeMutex;
++  std::unordered_map<uintptr_t, StreamWindowCache> mWindowStates;
++  uint64_t mNextShowSeq = 0;
++  std::vector<uint8_t> mCompositeScratch;
 +
 +  // Accessed exclusively on MainThread inside DispatchInputOnMainThread / Reset.
 +  MainThreadInputState mMainInputState;
