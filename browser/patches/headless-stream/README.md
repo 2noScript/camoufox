@@ -65,11 +65,11 @@ tabs) and web content.
 
 ## Interactive Web Example
 
-[examples/web_live_control.py](examples/web_live_control.py) is a dependency-free
+[examples/web_live_control.py](../../../examples/web_live_control.py) is a dependency-free
 WebSocket + WebGL2 reference server that bridges the `AF_UNIX` socket to a live
 browser viewer (`ws://127.0.0.1:18765/ws`) with mouse, wheel, keyboard, and
 paste support:
 
 ```bash
-python3 browser/patches/headless-stream/examples/web_live_control.py
+python3 examples/web_live_control.py
 ```

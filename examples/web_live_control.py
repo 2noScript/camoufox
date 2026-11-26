@@ -10,8 +10,8 @@ Features demonstrated with zero external dependencies (Python stdlib only):
     and UTF-8 paste text back to Camoufox via `CAMI` v1 packets
 
 Usage:
-    python3 browser/patches/headless-stream/examples/web_live_control.py
-    python3 browser/patches/headless-stream/examples/web_live_control.py --url https://example.com --port 18765
+    python3 examples/web_live_control.py
+    python3 examples/web_live_control.py --url https://example.com --port 18765
 """
 
 import argparse
@@ -413,7 +413,7 @@ def resolve_camoufox_binary(explicit: str | None) -> Path:
     for var in ("CAMOUFOX_EXECUTABLE_PATH", "CAMOUFOX_BINARY"):
         if os.environ.get(var):
             return Path(os.environ[var]).expanduser().resolve()
-    browser_dir = Path(__file__).resolve().parents[3]
+    browser_dir = Path(__file__).resolve().parents[1] / "browser"
     # Prefer the macOS .app bundle executable when present; dist/bin/camoufox-bin
     # on macOS lacks the bundled XUL framework and fails with "Couldn't load XPCOM".
     mac_candidates = sorted(
