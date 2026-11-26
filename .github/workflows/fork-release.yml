@@ -107,6 +107,7 @@ jobs:
           - target: linux
             arch: i686
     if: >-
+      github.event_name == 'push' ||
       (inputs.targets || 'all') == 'all' ||
       contains(format(',{0},', inputs.targets), format(',{0}-{1},', matrix.target, matrix.arch))
     steps:
@@ -182,11 +183,20 @@ jobs:
           if [ "$IS_PRE" = "true" ]; then
             pre_flag="--prerelease"
           fi
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "${{ needs.prepare.outputs.sha }}" \
-            $pre_flag \
-            --title "$TAG" \
-            --notes "Patched Camoufox build (headless-stream) with uBlock Origin $ubo_version." \
-            --generate-notes \
-            $(find artifacts -type f) manifest.json
+          target_flag=""
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            target_flag="--target ${{ needs.prepare.outputs.sha }}"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              $(find artifacts -type f) manifest.json
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              $target_flag \
+              $pre_flag \
+              --title "$TAG" \
+              --notes "Patched Camoufox build (headless-stream) with uBlock Origin $ubo_version." \
+              --generate-notes \
+              $(find artifacts -type f) manifest.json
+          fi
