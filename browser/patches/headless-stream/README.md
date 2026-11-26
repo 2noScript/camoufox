@@ -62,3 +62,14 @@ tabs) and web content.
 | 24 | `i32` | `button` | Mouse button `0..4`, or Wheel `deltaX` (px) |
 | 28 | `i32` | `data` | Wheel `deltaY` (px), or DOM `keyCode` (`0`=auto) |
 | 32 | `u32` | `text_len` | UTF-8 payload byte count (`"key\tcode"` for KeyDown/Up, UTF-8 string for Text) |
+
+## Interactive Web Example
+
+[examples/web_live_control.py](examples/web_live_control.py) is a dependency-free
+WebSocket + WebGL2 reference server that bridges the `AF_UNIX` socket to a live
+browser viewer (`ws://127.0.0.1:18765/ws`) with mouse, wheel, keyboard, and
+paste support:
+
+```bash
+python3 browser/patches/headless-stream/examples/web_live_control.py
+```
