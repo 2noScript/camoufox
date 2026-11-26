@@ -1,4 +1,128 @@
+diff --git a/widget/ThemeCocoa.cpp b/widget/ThemeCocoa.cpp
+index a229b739ee..dceaa59301 100644
+--- a/widget/ThemeCocoa.cpp
++++ b/widget/ThemeCocoa.cpp
+@@ -17,9 +17,12 @@ void ThemeCocoa::DrawWidgetBackground(gfxContext* aContext, nsIFrame* aFrame,
+                                       DrawOverflow aDrawOverflow) {
+   switch (aAppearance) {
+     case StyleAppearance::Tooltip:
+-      // Cocoa tooltip background and border are already drawn by the
+-      // OS window server.
+-      return;
++      if (!gfxPlatform::IsHeadless()) {
++        // Cocoa tooltip background and border are already drawn by the
++        // OS window server.
++        return;
++      }
++      break;
+     default:
+       break;
+   }
+@@ -35,9 +38,12 @@ bool ThemeCocoa::CreateWebRenderCommandsForWidget(
+     StyleAppearance aAppearance, const nsRect& aRect) {
+   switch (aAppearance) {
+     case StyleAppearance::Tooltip:
+-      // Cocoa tooltip background and border are already drawn by the
+-      // OS window server.
+-      return true;
++      if (!gfxPlatform::IsHeadless()) {
++        // Cocoa tooltip background and border are already drawn by the
++        // OS window server.
++        return true;
++      }
++      break;
+     default:
+       break;
+   }
+diff --git a/widget/cocoa/nsNativeThemeCocoa.mm b/widget/cocoa/nsNativeThemeCocoa.mm
+index 85e4666884..aaf14d5014 100644
+--- a/widget/cocoa/nsNativeThemeCocoa.mm
++++ b/widget/cocoa/nsNativeThemeCocoa.mm
+@@ -36,7 +36,10 @@
+ #include "nsStyleConsts.h"
+ 
+ #include <algorithm>
++#include "ThemeColors.h"
++#include "ThemeDrawing.h"
+ #include "gfxContext.h"
++#include "gfxPlatform.h"
+ #include "gfxQuartzNativeDrawing.h"
+ #include "gfxQuartzSurface.h"
+ #include "gfxUtils.h"  // for ToDeviceColor
+@@ -1296,6 +1299,44 @@ Maybe<nsNativeThemeCocoa::WidgetInfo> nsNativeThemeCocoa::ComputeWidgetInfo(
+   NS_OBJC_END_TRY_BLOCK_RETURN(Nothing());
+ }
+ 
++template <typename PaintBackendData>
++static bool PaintHeadlessPopupBackground(
++    PaintBackendData& aPaintData, nsIFrame* aFrame, StyleAppearance aAppearance,
++    const nsRect& aRect, mozilla::widget::Theme::DPIRatio aDpiRatio) {
++  if (!gfxPlatform::IsHeadless() ||
++      (aAppearance != StyleAppearance::Menupopup &&
++       aAppearance != StyleAppearance::Tooltip)) {
++    return false;
++  }
++
++  // Headless macOS popups lack NSVisualEffectView, so draw a rounded menu or
++  // tooltip surface here rather than leaving the panel transparent.
++  const mozilla::widget::ThemeColors colors(aFrame, aAppearance);
++  const LayoutDeviceRect devPxRect = LayoutDeviceRect::FromAppUnits(
++      aRect, aFrame->PresContext()->AppUnitsPerDevPixel());
++  const CSSCoord borderWidth(1.0f);
++
++  if (aAppearance == StyleAppearance::Tooltip) {
++    const CSSCoord radius(nsCocoaFeatures::OnGoldenGateOrLater() ? 5.0f : 0.0f);
++    mozilla::widget::ThemeDrawing::PaintRoundedRectWithRadius(
++        aPaintData, devPxRect,
++        colors.System(StyleSystemColor::Infobackground),
++        colors.System(StyleSystemColor::Infotext), borderWidth, radius,
++        aDpiRatio);
++    return true;
++  }
++
++  const gfx::sRGBColor bgColor = colors.System(StyleSystemColor::Menu);
++  const gfx::sRGBColor borderColor =
++      colors.IsDark() ? gfx::sRGBColor(1.0f, 1.0f, 1.0f, 0.16f)
++                      : gfx::sRGBColor(0.0f, 0.0f, 0.0f, 0.14f);
++  const CSSCoord radius(nsCocoaFeatures::OnTahoeOrLater() ? 12.0f : 6.0f);
++  mozilla::widget::ThemeDrawing::PaintRoundedRectWithRadius(
++      aPaintData, devPxRect, bgColor, borderColor, borderWidth, radius,
++      aDpiRatio);
++  return true;
++}
++
+ void nsNativeThemeCocoa::DrawWidgetBackground(
+     gfxContext* aContext, nsIFrame* aFrame, StyleAppearance aAppearance,
+     const nsRect& aRect, const nsRect& aDirtyRect, DrawOverflow aDrawOverflow) {
+@@ -1306,6 +1347,12 @@ void nsNativeThemeCocoa::DrawWidgetBackground(
+                                             aRect, aDirtyRect, aDrawOverflow);
+   }
+ 
++  if (PaintHeadlessPopupBackground(*aContext->GetDrawTarget(), aFrame,
++                                   aAppearance, aRect,
++                                   GetDPIRatio(aFrame, aAppearance))) {
++    return;
++  }
++
+   Maybe<WidgetInfo> widgetInfo = ComputeWidgetInfo(aFrame, aAppearance, aRect);
+ 
+   if (!widgetInfo) {
+@@ -1426,6 +1473,13 @@ bool nsNativeThemeCocoa::CreateWebRenderCommandsForWidget(
+         aBuilder, aResources, aSc, aManager, aFrame, aAppearance, aRect);
+   }
+ 
++  mozilla::widget::WebRenderBackendData data{aBuilder, aResources, aSc,
++                                             aManager};
++  if (PaintHeadlessPopupBackground(data, aFrame, aAppearance, aRect,
++                                   GetDPIRatio(aFrame, aAppearance))) {
++    return true;
++  }
++
+   // This list needs to stay consistent with the list in DrawWidgetBackground.
+   // For every switch case in DrawWidgetBackground, there are three choices:
+   //  - If the case in DrawWidgetBackground draws nothing for the given widget
 diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+index 2804831ec7..792a775304 100644
 --- a/widget/headless/HeadlessCompositorWidget.cpp
 +++ b/widget/headless/HeadlessCompositorWidget.cpp
 @@ -2,9 +2,12 @@
@@ -14,7 +138,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
  
  #include "VsyncDispatcher.h"
  #include "mozilla/widget/PlatformWidgetTypes.h"
-@@ -19,7 +22,21 @@
+@@ -19,7 +22,21 @@ HeadlessCompositorWidget::HeadlessCompositorWidget(
        mWidget(aWindow),
        mMon("snapshotListener"),
        mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
@@ -37,7 +161,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
  
  void HeadlessCompositorWidget::SetSnapshotListener(HeadlessWidget::SnapshotListener&& listener) {
    MOZ_ASSERT(NS_IsMainThread());
-@@ -34,11 +51,68 @@
+@@ -34,6 +51,12 @@ void HeadlessCompositorWidget::SetSnapshotListener(HeadlessWidget::SnapshotListe
  
  already_AddRefed<gfx::DrawTarget> HeadlessCompositorWidget::StartRemoteDrawingInRegion(
      const LayoutDeviceIntRegion& aInvalidRegion) {
@@ -50,10 +174,10 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
    if (!mDrawTarget)
      return nullptr;
  
-   RefPtr<gfx::DrawTarget> result = mDrawTarget;
+@@ -41,6 +64,57 @@ already_AddRefed<gfx::DrawTarget> HeadlessCompositorWidget::StartRemoteDrawingIn
    return result.forget();
-+}
-+
+ }
+ 
 +void HeadlessCompositorWidget::EndRemoteDrawingInRegion(
 +    gfx::DrawTarget* aDrawTarget, const LayoutDeviceIntRegion& aInvalidRegion) {
 +  EmitRawFrameIfReady(false);
@@ -103,10 +227,12 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
 +
 +  mLastRawCaptureTime = now;
 +  server->SubmitSurface(this, dataSurface.get());
- }
- 
++}
++
  void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
-@@ -52,8 +126,14 @@
+   if (RefPtr<CompositorVsyncDispatcher> cvd =
+           mWidget->GetCompositorVsyncDispatcher()) {
+@@ -52,8 +126,14 @@ nsIWidget* HeadlessCompositorWidget::RealWidget() { return mWidget; }
  
  void HeadlessCompositorWidget::NotifyClientSizeChanged(
      const LayoutDeviceIntSize& aClientSize) {
@@ -124,6 +250,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/Head
        "HeadlessCompositorWidget::UpdateDrawTarget", this,
        &HeadlessCompositorWidget::UpdateDrawTarget,
 diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
+index 68e7eb1518..527221b5f8 100644
 --- a/widget/headless/HeadlessCompositorWidget.h
 +++ b/widget/headless/HeadlessCompositorWidget.h
 @@ -5,7 +5,10 @@
@@ -137,7 +264,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  #include "mozilla/widget/CompositorWidget.h"
  #include "mozilla/widget/HeadlessWidget.h"
  
-@@ -13,6 +16,7 @@
+@@ -13,6 +16,7 @@ namespace mozilla {
  namespace widget {
  
  class HeadlessCompositorWidgetInitData;
@@ -145,7 +272,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  
  class HeadlessCompositorWidget : public CompositorWidget,
                                   public CompositorWidgetDelegate {
-@@ -20,12 +24,17 @@
+@@ -20,13 +24,18 @@ class HeadlessCompositorWidget : public CompositorWidget,
    HeadlessCompositorWidget(const HeadlessCompositorWidgetInitData& aInitData,
                             const layers::CompositorOptions& aOptions,
                             HeadlessWidget* aWindow);
@@ -157,13 +284,14 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  
    // CompositorWidget Overrides
    already_AddRefed<gfx::DrawTarget> StartRemoteDrawingInRegion(
-+      const LayoutDeviceIntRegion& aInvalidRegion) override;
+       const LayoutDeviceIntRegion& aInvalidRegion) override;
 +  void EndRemoteDrawingInRegion(
 +      gfx::DrawTarget* aDrawTarget,
-       const LayoutDeviceIntRegion& aInvalidRegion) override;
++      const LayoutDeviceIntRegion& aInvalidRegion) override;
  
    uintptr_t GetWidgetKey() override;
-@@ -47,6 +56,7 @@
+ 
+@@ -47,6 +56,7 @@ class HeadlessCompositorWidget : public CompositorWidget,
    void UpdateDrawTarget(const LayoutDeviceIntSize& aClientSize);
    void PeriodicSnapshot();
    void TakeSnapshot();
@@ -171,7 +299,7 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  
    HeadlessWidget* mWidget;
    mozilla::ReentrantMonitor mMon;
-@@ -56,6 +66,9 @@
+@@ -56,6 +66,9 @@ class HeadlessCompositorWidget : public CompositorWidget,
  
    HeadlessWidget::SnapshotListener mSnapshotListener;
    RefPtr<gfx::DrawTarget> mDrawTarget;
@@ -181,192 +309,9 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  };
  
  }  // namespace widget
-diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
---- a/widget/headless/HeadlessWidget.cpp
-+++ b/widget/headless/HeadlessWidget.cpp
-@@ -7,6 +7,7 @@
- #include "ErrorList.h"
- #include "HeadlessCompositorWidget.h"
- #include "HeadlessKeyBindings.h"
-+#include "HeadlessStreamServer.h"
- #include "InputData.h"
- #include "MouseEvents.h"
- #include "UnitTransforms.h"
-@@ -55,6 +56,7 @@
- namespace widget {
- 
- StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sActiveWindows;
-+StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sPopupWidgets;
- 
- already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
-   if (!sActiveWindows) {
-@@ -66,6 +68,56 @@
-   }
-   RefPtr<HeadlessWidget> widget = sActiveWindows->ElementAt(length - 1);
-   return widget.forget();
-+}
-+
-+/* static */
-+already_AddRefed<HeadlessWidget> HeadlessWidget::FindPopupAtPoint(
-+    const LayoutDeviceIntPoint& aScreenPt) {
-+  MOZ_ASSERT(NS_IsMainThread());
-+  if (!sPopupWidgets) {
-+    return nullptr;
-+  }
-+  for (size_t i = sPopupWidgets->Length(); i > 0; --i) {
-+    HeadlessWidget* w = sPopupWidgets->ElementAt(i - 1);
-+    if (!w->mDestroyed && w->mVisible && w->mBounds.Contains(aScreenPt)) {
-+      RefPtr<HeadlessWidget> ret = w;
-+      return ret.forget();
-+    }
-+  }
-+  return nullptr;
-+}
-+
-+/* static */
-+void HeadlessWidget::SyncStreamWindowState(HeadlessWidget* aWidget) {
-+  if (!aWidget) {
-+    return;
-+  }
-+  HeadlessStreamServer* server = HeadlessStreamServer::Get();
-+  if (!server->IsEnabled()) {
-+    return;
-+  }
-+  server->UpdateWindowState(
-+      reinterpret_cast<uintptr_t>(aWidget),
-+      aWidget->mWindowType == WindowType::Popup,
-+      aWidget->mVisible && !aWidget->mDestroyed, aWidget->mBounds.X(),
-+      aWidget->mBounds.Y(), aWidget->mBounds.Width(),
-+      aWidget->mBounds.Height());
-+}
-+
-+/* static */
-+already_AddRefed<HeadlessWidget> HeadlessWidget::FindActiveWindow(
-+    uintptr_t aWidgetKey) {
-+  MOZ_ASSERT(NS_IsMainThread());
-+  if (aWidgetKey && sActiveWindows) {
-+    for (size_t i = sActiveWindows->Length(); i > 0; --i) {
-+      HeadlessWidget* w = sActiveWindows->ElementAt(i - 1);
-+      if (reinterpret_cast<uintptr_t>(w) == aWidgetKey && !w->mDestroyed) {
-+        RefPtr<HeadlessWidget> ret = w;
-+        return ret.forget();
-+      }
-+    }
-+  }
-+  return GetActiveWindow();
- }
- 
- HeadlessWidget::HeadlessWidget()
-@@ -83,6 +135,10 @@
-     sActiveWindows = new nsTArray<HeadlessWidget*>();
-     ClearOnShutdown(&sActiveWindows);
-   }
-+  if (!sPopupWidgets) {
-+    sPopupWidgets = new nsTArray<HeadlessWidget*>();
-+    ClearOnShutdown(&sPopupWidgets);
-+  }
- }
- 
- HeadlessWidget::~HeadlessWidget() {
-@@ -97,6 +153,10 @@
-   }
-   LOG(("HeadlessWidget::Destroy [%p]\n", (void*)this));
-   mDestroyed = true;
-+  if (sPopupWidgets) {
-+    sPopupWidgets->RemoveElement(this);
-+  }
-+  SyncStreamWindowState(this);
- 
-   if (sActiveWindows) {
-     int32_t index = sActiveWindows->IndexOf(this);
-@@ -127,6 +187,7 @@
-   mBounds = aRect;
-   mRestoreBounds = aRect;
-   mAlwaysOnTop = aInitData.mAlwaysOnTop;
-+  SyncStreamWindowState(this);
-   return NS_OK;
- }
- 
-@@ -167,6 +228,14 @@
-   mVisible = aState;
- 
-   LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
-+
-+  if (mWindowType == WindowType::Popup && sPopupWidgets) {
-+    sPopupWidgets->RemoveElement(this);
-+    if (aState && !mDestroyed) {
-+      sPopupWidgets->AppendElement(this);
-+    }
-+  }
-+  SyncStreamWindowState(this);
- 
-   // Top-level window and dialogs are activated/raised when shown.
-   // NB: alwaysontop windows are generally used for peripheral indicators.
-@@ -226,6 +295,7 @@
- 
-   mBounds.MoveTo(aX, aY);
-   NotifyWindowMoved(mBounds.TopLeft());
-+  SyncStreamWindowState(this);
- }
- 
- LayoutDeviceIntPoint HeadlessWidget::WidgetToScreenOffset() {
-@@ -264,6 +334,7 @@
-   if (mAttachedWidgetListener) {
-     mAttachedWidgetListener->WindowResized(this, mBounds.Size());
-   }
-+  SyncStreamWindowState(this);
- }
- 
- void HeadlessWidget::Resize(const DesktopRect& aRect, bool aRepaint) {
-diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
---- a/widget/headless/HeadlessWidget.h
-+++ b/widget/headless/HeadlessWidget.h
-@@ -130,8 +130,20 @@
-   using SnapshotListener = std::function<void(RefPtr<gfx::DataSourceSurface>&&)>;
-   void SetSnapshotListener(SnapshotListener&& listener);
- 
-+  // Returns the currently active TopLevel/Dialog widget matching aWidgetKey,
-+  // or the top active widget if none matches. Must be called on MainThread.
-+  static already_AddRefed<HeadlessWidget> FindActiveWindow(
-+      uintptr_t aWidgetKey);
-+  // Returns the topmost visible Popup widget containing aScreenPt, if any.
-+  // Must be called on MainThread.
-+  static already_AddRefed<HeadlessWidget> FindPopupAtPoint(
-+      const LayoutDeviceIntPoint& aScreenPt);
-+  bool IsDestroyed() const { return mDestroyed; }
-+
-  private:
-   ~HeadlessWidget();
-+  static StaticAutoPtr<nsTArray<HeadlessWidget*>> sPopupWidgets;
-+  static void SyncStreamWindowState(HeadlessWidget* aWidget);
-   bool mEnabled;
-   bool mVisible;
-   bool mDestroyed;
-diff --git a/widget/headless/moz.build b/widget/headless/moz.build
---- a/widget/headless/moz.build
-+++ b/widget/headless/moz.build
-@@ -8,6 +8,8 @@
- DIRS += ["tests"]
- 
- LOCAL_INCLUDES += [
-+    "/camoucfg",
-+    "/media/libyuv/libyuv/include",
-     "/widget",
-     "/widget/headless",
- ]
-@@ -21,6 +23,10 @@
- EXPORTS.mozilla.widget += [
-     "HeadlessCompositorWidget.h",
-     "HeadlessWidget.h",
-+]
-+
-+SOURCES += [
-+    "HeadlessStreamServer.cpp",
- ]
- 
- UNIFIED_SOURCES += [
 diff --git a/widget/headless/HeadlessStreamServer.cpp b/widget/headless/HeadlessStreamServer.cpp
 new file mode 100644
+index 0000000000..d984a74dde
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.cpp
 @@ -0,0 +1,1003 @@
@@ -1375,6 +1320,7 @@ new file mode 100644
 +}  // namespace mozilla
 diff --git a/widget/headless/HeadlessStreamServer.h b/widget/headless/HeadlessStreamServer.h
 new file mode 100644
+index 0000000000..3275049b82
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.h
 @@ -0,0 +1,170 @@
@@ -1548,3 +1494,226 @@ new file mode 100644
 +}  // namespace mozilla
 +
 +#endif  // widget_headless_HeadlessStreamServer_h
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+index 0979e7f0a4..28697dd180 100644
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -7,6 +7,7 @@
+ #include "ErrorList.h"
+ #include "HeadlessCompositorWidget.h"
+ #include "HeadlessKeyBindings.h"
++#include "HeadlessStreamServer.h"
+ #include "InputData.h"
+ #include "MouseEvents.h"
+ #include "UnitTransforms.h"
+@@ -55,6 +56,7 @@ namespace mozilla {
+ namespace widget {
+ 
+ StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sActiveWindows;
++StaticAutoPtr<nsTArray<HeadlessWidget*>> HeadlessWidget::sPopupWidgets;
+ 
+ already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
+   if (!sActiveWindows) {
+@@ -68,6 +70,56 @@ already_AddRefed<HeadlessWidget> HeadlessWidget::GetActiveWindow() {
+   return widget.forget();
+ }
+ 
++/* static */
++already_AddRefed<HeadlessWidget> HeadlessWidget::FindPopupAtPoint(
++    const LayoutDeviceIntPoint& aScreenPt) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!sPopupWidgets) {
++    return nullptr;
++  }
++  for (size_t i = sPopupWidgets->Length(); i > 0; --i) {
++    HeadlessWidget* w = sPopupWidgets->ElementAt(i - 1);
++    if (!w->mDestroyed && w->mVisible && w->mBounds.Contains(aScreenPt)) {
++      RefPtr<HeadlessWidget> ret = w;
++      return ret.forget();
++    }
++  }
++  return nullptr;
++}
++
++/* static */
++void HeadlessWidget::SyncStreamWindowState(HeadlessWidget* aWidget) {
++  if (!aWidget) {
++    return;
++  }
++  HeadlessStreamServer* server = HeadlessStreamServer::Get();
++  if (!server->IsEnabled()) {
++    return;
++  }
++  server->UpdateWindowState(
++      reinterpret_cast<uintptr_t>(aWidget),
++      aWidget->mWindowType == WindowType::Popup,
++      aWidget->mVisible && !aWidget->mDestroyed, aWidget->mBounds.X(),
++      aWidget->mBounds.Y(), aWidget->mBounds.Width(),
++      aWidget->mBounds.Height());
++}
++
++/* static */
++already_AddRefed<HeadlessWidget> HeadlessWidget::FindActiveWindow(
++    uintptr_t aWidgetKey) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (aWidgetKey && sActiveWindows) {
++    for (size_t i = sActiveWindows->Length(); i > 0; --i) {
++      HeadlessWidget* w = sActiveWindows->ElementAt(i - 1);
++      if (reinterpret_cast<uintptr_t>(w) == aWidgetKey && !w->mDestroyed) {
++        RefPtr<HeadlessWidget> ret = w;
++        return ret.forget();
++      }
++    }
++  }
++  return GetActiveWindow();
++}
++
+ HeadlessWidget::HeadlessWidget()
+     : mEnabled(true),
+       mVisible(false),
+@@ -83,6 +135,10 @@ HeadlessWidget::HeadlessWidget()
+     sActiveWindows = new nsTArray<HeadlessWidget*>();
+     ClearOnShutdown(&sActiveWindows);
+   }
++  if (!sPopupWidgets) {
++    sPopupWidgets = new nsTArray<HeadlessWidget*>();
++    ClearOnShutdown(&sPopupWidgets);
++  }
+ }
+ 
+ HeadlessWidget::~HeadlessWidget() {
+@@ -97,6 +153,10 @@ void HeadlessWidget::Destroy() {
+   }
+   LOG(("HeadlessWidget::Destroy [%p]\n", (void*)this));
+   mDestroyed = true;
++  if (sPopupWidgets) {
++    sPopupWidgets->RemoveElement(this);
++  }
++  SyncStreamWindowState(this);
+ 
+   if (sActiveWindows) {
+     int32_t index = sActiveWindows->IndexOf(this);
+@@ -127,9 +187,20 @@ nsresult HeadlessWidget::Create(nsIWidget* aParent,
+   mBounds = aRect;
+   mRestoreBounds = aRect;
+   mAlwaysOnTop = aInitData.mAlwaysOnTop;
++  mTransparencyMode.store(aInitData.mTransparencyMode,
++                          std::memory_order_release);
++  SyncStreamWindowState(this);
+   return NS_OK;
+ }
+ 
++void HeadlessWidget::SetTransparencyMode(TransparencyMode aMode) {
++  mTransparencyMode.store(aMode, std::memory_order_release);
++}
++
++TransparencyMode HeadlessWidget::GetTransparencyMode() {
++  return mTransparencyMode.load(std::memory_order_acquire);
++}
++
+ void HeadlessWidget::GetCompositorWidgetInitData(
+     mozilla::widget::CompositorWidgetInitData* aInitData) {
+   *aInitData =
+@@ -168,6 +239,14 @@ void HeadlessWidget::Show(bool aState) {
+ 
+   LOG(("HeadlessWidget::Show [%p] state %d\n", (void*)this, aState));
+ 
++  if (mWindowType == WindowType::Popup && sPopupWidgets) {
++    sPopupWidgets->RemoveElement(this);
++    if (aState && !mDestroyed) {
++      sPopupWidgets->AppendElement(this);
++    }
++  }
++  SyncStreamWindowState(this);
++
+   // Top-level window and dialogs are activated/raised when shown.
+   // NB: alwaysontop windows are generally used for peripheral indicators.
+   //     So we don't focus them by default unless they are a Document
+@@ -226,6 +305,7 @@ void HeadlessWidget::MoveInternal(int32_t aX, int32_t aY) {
+ 
+   mBounds.MoveTo(aX, aY);
+   NotifyWindowMoved(mBounds.TopLeft());
++  SyncStreamWindowState(this);
+ }
+ 
+ LayoutDeviceIntPoint HeadlessWidget::WidgetToScreenOffset() {
+@@ -264,6 +344,7 @@ void HeadlessWidget::ResizeInternal(int32_t aWidth, int32_t aHeight,
+   if (mAttachedWidgetListener) {
+     mAttachedWidgetListener->WindowResized(this, mBounds.Size());
+   }
++  SyncStreamWindowState(this);
+ }
+ 
+ void HeadlessWidget::Resize(const DesktopRect& aRect, bool aRepaint) {
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+index b9f4166887..f8721e66a8 100644
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -5,6 +5,8 @@
+ #ifndef HEADLESSWIDGET_H
+ #define HEADLESSWIDGET_H
+ 
++#include <atomic>
++
+ #include "CompositorWidget.h"
+ #include "mozilla/dom/WheelEventBinding.h"
+ #include "mozilla/widget/InProcessCompositorWidget.h"
+@@ -82,6 +84,8 @@ class HeadlessWidget final : public nsIWidget {
+     mInputContext = aContext;
+   }
+   InputContext GetInputContext() override { return mInputContext; }
++  void SetTransparencyMode(TransparencyMode aMode) override;
++  TransparencyMode GetTransparencyMode() override;
+ 
+   WindowRenderer* GetWindowRenderer() override;
+ 
+@@ -130,12 +134,25 @@ class HeadlessWidget final : public nsIWidget {
+   using SnapshotListener = std::function<void(RefPtr<gfx::DataSourceSurface>&&)>;
+   void SetSnapshotListener(SnapshotListener&& listener);
+ 
++  // Returns the currently active TopLevel/Dialog widget matching aWidgetKey,
++  // or the top active widget if none matches. Must be called on MainThread.
++  static already_AddRefed<HeadlessWidget> FindActiveWindow(
++      uintptr_t aWidgetKey);
++  // Returns the topmost visible Popup widget containing aScreenPt, if any.
++  // Must be called on MainThread.
++  static already_AddRefed<HeadlessWidget> FindPopupAtPoint(
++      const LayoutDeviceIntPoint& aScreenPt);
++  bool IsDestroyed() const { return mDestroyed; }
++
+  private:
+   ~HeadlessWidget();
++  static StaticAutoPtr<nsTArray<HeadlessWidget*>> sPopupWidgets;
++  static void SyncStreamWindowState(HeadlessWidget* aWidget);
+   bool mEnabled;
+   bool mVisible;
+   bool mDestroyed;
+   bool mAlwaysOnTop;
++  std::atomic<TransparencyMode> mTransparencyMode{TransparencyMode::Opaque};
+   CompositorWidgetDelegate* mCompositorWidgetDelegate;
+   nsSizeMode mSizeMode;
+   // The size mode before entering fullscreen mode.
+diff --git a/widget/headless/moz.build b/widget/headless/moz.build
+index 7af6ff99d2..4806b55d34 100644
+--- a/widget/headless/moz.build
++++ b/widget/headless/moz.build
+@@ -8,6 +8,8 @@ with Files("**"):
+ DIRS += ["tests"]
+ 
+ LOCAL_INCLUDES += [
++    "/camoucfg",
++    "/media/libyuv/libyuv/include",
+     "/widget",
+     "/widget/headless",
+ ]
+@@ -23,6 +25,10 @@ EXPORTS.mozilla.widget += [
+     "HeadlessWidget.h",
+ ]
+ 
++SOURCES += [
++    "HeadlessStreamServer.cpp",
++]
++
+ UNIFIED_SOURCES += [
+     "HeadlessClipboard.cpp",
+     "HeadlessClipboardData.cpp",
