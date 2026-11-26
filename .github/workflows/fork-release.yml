@@ -22,7 +22,6 @@ on:
       - "browser/**"
       - "ci/release.py"
       - "ci/run_*.py"
-      - ".github/workflows/fork-release.yml"
       - ".github/actions/build-host/**"
 
 permissions: {}
@@ -41,6 +40,7 @@ jobs:
       contents: read
     outputs:
       ubo: ${{ steps.ubo.outputs.pin }}
+      version: ${{ steps.meta.outputs.version }}
       digest: ${{ steps.meta.outputs.digest }}
       browser_tag: ${{ steps.meta.outputs.browser_tag }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
@@ -106,6 +106,7 @@ jobs:
                   raise SystemExit(f"No matching targets in {raw_targets!r}")
 
           matrix = {"include": [{"target": t, "arch": a} for t, a in selected]}
+          set_output("version", ver)
           set_output("digest", source_digest())
           set_output("browser_tag", tag)
           set_output("prerelease", "true" if os.environ["INPUT_PRE"].lower() == "true" else "false")
@@ -138,6 +139,15 @@ jobs:
           arch: ${{ matrix.arch }}
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target }}-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}-${{ hashFiles('browser/patches/**', 'browser/additions/**', 'browser/assets/*.mozconfig', 'browser/scripts/data/pgo-profiles.json') }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}-
+            ccache-${{ matrix.target }}-${{ matrix.arch }}-
+
       - name: Fetch the font bundle
         working-directory: browser
         run: make fonts-extract
@@ -149,12 +159,19 @@ jobs:
           python3 scripts/verify-fonts.py
 
       - name: Prepare the source tree
-        run: python3 -m ci.run_prepare
+        run: |
+          ccache -M 2G && ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          python3 -m ci.run_prepare
 
       - name: Build
         env:
           CARGO_BUILD_JOBS: "1"
         run: python3 -m ci.run_build --target ${{ matrix.target }} --arch ${{ matrix.arch }}
+
+      - name: Ccache stats
+        if: always()
+        run: ccache -s || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
