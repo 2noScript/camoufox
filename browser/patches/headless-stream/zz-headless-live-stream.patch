@@ -1,0 +1,744 @@
+diff --git a/widget/headless/HeadlessCompositorWidget.cpp b/widget/headless/HeadlessCompositorWidget.cpp
+--- a/widget/headless/HeadlessCompositorWidget.cpp
++++ b/widget/headless/HeadlessCompositorWidget.cpp
+@@ -2,9 +2,12 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#include <algorithm>
++
+ #include "mozilla/gfx/2D.h"
+ #include "mozilla/layers/CompositorThread.h"
+ #include "HeadlessCompositorWidget.h"
++#include "HeadlessStreamServer.h"
+ 
+ #include "VsyncDispatcher.h"
+ #include "mozilla/widget/PlatformWidgetTypes.h"
+@@ -19,7 +22,21 @@
+       mWidget(aWindow),
+       mMon("snapshotListener"),
+       mClientSize(LayoutDeviceIntSize(aInitData.InitialClientSize()),
+-                  "HeadlessCompositorWidget::mClientSize") {}
++                  "HeadlessCompositorWidget::mClientSize") {
++  HeadlessStreamServer* server = HeadlessStreamServer::Get();
++  if (server->IsEnabled()) {
++    mStreamSlot = server->RegisterWidget(this);
++    auto size = mClientSize.Lock();
++    server->UpdateWidgetSize(mStreamSlot, size->width, size->height);
++  }
++}
++
++HeadlessCompositorWidget::~HeadlessCompositorWidget() {
++  if (mStreamSlot) {
++    HeadlessStreamServer::Get()->UnregisterWidget(mStreamSlot);
++    mStreamSlot.reset();
++  }
++}
+ 
+ void HeadlessCompositorWidget::SetSnapshotListener(HeadlessWidget::SnapshotListener&& listener) {
+   MOZ_ASSERT(NS_IsMainThread());
+@@ -41,6 +58,57 @@
+   return result.forget();
+ }
+ 
++void HeadlessCompositorWidget::EndRemoteDrawingInRegion(
++    gfx::DrawTarget* aDrawTarget, const LayoutDeviceIntRegion& aInvalidRegion) {
++  EmitRawFrameIfReady(false);
++}
++
++void HeadlessCompositorWidget::TrailingRawSnapshot() {
++  mRawTrailingScheduled = false;
++  EmitRawFrameIfReady(true);
++}
++
++void HeadlessCompositorWidget::EmitRawFrameIfReady(bool aForce) {
++  HeadlessStreamServer* server = HeadlessStreamServer::Get();
++  if (!server->IsEnabled() || !server->HasClient() || !mDrawTarget) {
++    return;
++  }
++
++  const double intervalUs = 1000000.0 / static_cast<double>(server->TargetFps());
++  const mozilla::TimeDuration minInterval =
++      mozilla::TimeDuration::FromMicroseconds(intervalUs);
++  const mozilla::TimeStamp now = mozilla::TimeStamp::Now();
++
++  if (!aForce && !mLastRawCaptureTime.IsNull()) {
++    mozilla::TimeDuration elapsed = now - mLastRawCaptureTime;
++    if (elapsed < minInterval) {
++      if (!mRawTrailingScheduled) {
++        mRawTrailingScheduled = true;
++        uint32_t delayMs = static_cast<uint32_t>(
++            std::max(1.0, (minInterval - elapsed).ToMilliseconds()));
++        NS_DelayedDispatchToCurrentThread(
++            NewRunnableMethod(
++                "HeadlessCompositorWidget::TrailingRawSnapshot", this,
++                &HeadlessCompositorWidget::TrailingRawSnapshot),
++            delayMs);
++      }
++      return;
++    }
++  }
++
++  RefPtr<gfx::SourceSurface> snapshot = mDrawTarget->Snapshot();
++  if (!snapshot) {
++    return;
++  }
++  RefPtr<gfx::DataSourceSurface> dataSurface = snapshot->GetDataSurface();
++  if (!dataSurface) {
++    return;
++  }
++
++  mLastRawCaptureTime = now;
++  server->SubmitSurface(this, dataSurface.get());
++}
++
+ void HeadlessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
+   if (RefPtr<CompositorVsyncDispatcher> cvd =
+           mWidget->GetCompositorVsyncDispatcher()) {
+@@ -52,8 +120,14 @@
+ 
+ void HeadlessCompositorWidget::NotifyClientSizeChanged(
+     const LayoutDeviceIntSize& aClientSize) {
+-  auto size = mClientSize.Lock();
+-  *size = aClientSize;
++  {
++    auto size = mClientSize.Lock();
++    *size = aClientSize;
++  }
++  if (mStreamSlot) {
++    HeadlessStreamServer::Get()->UpdateWidgetSize(mStreamSlot, aClientSize.width,
++                                                  aClientSize.height);
++  }
+   layers::CompositorThread()->Dispatch(NewRunnableMethod<LayoutDeviceIntSize>(
+       "HeadlessCompositorWidget::UpdateDrawTarget", this,
+       &HeadlessCompositorWidget::UpdateDrawTarget,
+diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/HeadlessCompositorWidget.h
+--- a/widget/headless/HeadlessCompositorWidget.h
++++ b/widget/headless/HeadlessCompositorWidget.h
+@@ -5,7 +5,10 @@
+ #ifndef widget_headless_HeadlessCompositorWidget_h
+ #define widget_headless_HeadlessCompositorWidget_h
+ 
++#include <memory>
++
+ #include "mozilla/ReentrantMonitor.h"
++#include "mozilla/TimeStamp.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ #include "mozilla/widget/HeadlessWidget.h"
+ 
+@@ -13,6 +16,7 @@
+ namespace widget {
+ 
+ class HeadlessCompositorWidgetInitData;
++struct StreamWidgetSlot;
+ 
+ class HeadlessCompositorWidget : public CompositorWidget,
+                                  public CompositorWidgetDelegate {
+@@ -20,12 +24,17 @@
+   HeadlessCompositorWidget(const HeadlessCompositorWidgetInitData& aInitData,
+                            const layers::CompositorOptions& aOptions,
+                            HeadlessWidget* aWindow);
++  ~HeadlessCompositorWidget() override;
+ 
+   void NotifyClientSizeChanged(const LayoutDeviceIntSize& aClientSize) override;
+   void SetSnapshotListener(HeadlessWidget::SnapshotListener&& listener);
++  void EmitRawFrameIfReady(bool aForce);
+ 
+   // CompositorWidget Overrides
+   already_AddRefed<gfx::DrawTarget> StartRemoteDrawingInRegion(
++      const LayoutDeviceIntRegion& aInvalidRegion) override;
++  void EndRemoteDrawingInRegion(
++      gfx::DrawTarget* aDrawTarget,
+       const LayoutDeviceIntRegion& aInvalidRegion) override;
+ 
+   uintptr_t GetWidgetKey() override;
+@@ -47,6 +56,7 @@
+   void UpdateDrawTarget(const LayoutDeviceIntSize& aClientSize);
+   void PeriodicSnapshot();
+   void TakeSnapshot();
++  void TrailingRawSnapshot();
+ 
+   HeadlessWidget* mWidget;
+   mozilla::ReentrantMonitor mMon;
+@@ -56,6 +66,9 @@
+ 
+   HeadlessWidget::SnapshotListener mSnapshotListener;
+   RefPtr<gfx::DrawTarget> mDrawTarget;
++  std::shared_ptr<StreamWidgetSlot> mStreamSlot;
++  mozilla::TimeStamp mLastRawCaptureTime;
++  bool mRawTrailingScheduled = false;
+ };
+ 
+ }  // namespace widget
+diff --git a/widget/headless/moz.build b/widget/headless/moz.build
+--- a/widget/headless/moz.build
++++ b/widget/headless/moz.build
+@@ -8,6 +8,7 @@
+ DIRS += ["tests"]
+ 
+ LOCAL_INCLUDES += [
++    "/media/libyuv/libyuv/include",
+     "/widget",
+     "/widget/headless",
+ ]
+@@ -21,6 +22,10 @@
+ EXPORTS.mozilla.widget += [
+     "HeadlessCompositorWidget.h",
+     "HeadlessWidget.h",
++]
++
++SOURCES += [
++    "HeadlessStreamServer.cpp",
+ ]
+ 
+ UNIFIED_SOURCES += [
+diff --git a/widget/headless/HeadlessStreamServer.cpp b/widget/headless/HeadlessStreamServer.cpp
+new file mode 100644
+--- /dev/null
++++ b/widget/headless/HeadlessStreamServer.cpp
+@@ -0,0 +1,438 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "HeadlessStreamServer.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++
++#include "HeadlessCompositorWidget.h"
++#include "libyuv.h"
++#include "mozilla/layers/CompositorThread.h"
++#include "nsXULAppAPI.h"
++
++#if defined(XP_UNIX)
++#  include <errno.h>
++#  include <poll.h>
++#  include <sys/socket.h>
++#  include <sys/time.h>
++#  include <sys/un.h>
++#  include <unistd.h>
++#endif
++
++namespace mozilla {
++namespace widget {
++
++namespace {
++
++constexpr uint32_t kStreamMagic = 0x464D4143u;  // "CAMF" little-endian
++constexpr uint32_t kStreamVersion = 1u;
++constexpr int32_t kPrimaryMinWidth = 200;
++constexpr int32_t kPrimaryMinHeight = 200;
++
++#if defined(XP_UNIX)
++bool WriteExact(int aFd, const uint8_t* aData, size_t aLen) {
++  size_t sent = 0;
++  while (sent < aLen) {
++    int flags = 0;
++#  ifdef MSG_NOSIGNAL
++    flags |= MSG_NOSIGNAL;
++#  endif
++    ssize_t n = ::send(aFd, aData + sent, aLen - sent, flags);
++    if (n > 0) {
++      sent += static_cast<size_t>(n);
++      continue;
++    }
++    if (n < 0 && errno == EINTR) {
++      continue;
++    }
++    return false;
++  }
++  return true;
++}
++#endif
++
++uint64_t NowMicroseconds() {
++  auto now = std::chrono::steady_clock::now().time_since_epoch();
++  return static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::microseconds>(now).count());
++}
++
++}  // namespace
++
++/* static */
++HeadlessStreamServer* HeadlessStreamServer::Get() {
++  static std::once_flag sOnce;
++  static HeadlessStreamServer* sInstance = nullptr;
++  std::call_once(sOnce, []() { sInstance = new HeadlessStreamServer(); });
++  return sInstance;
++}
++
++HeadlessStreamServer::HeadlessStreamServer() {
++#if defined(XP_UNIX)
++  // Only expose the raw frame socket in the parent or GPU process, never in
++  // sandboxed content/utility processes.
++  if (!XRE_IsParentProcess() && !XRE_IsGPUProcess()) {
++    return;
++  }
++
++  const char* sockEnv = std::getenv("CAMOU_HEADLESS_STREAM_SOCKET");
++  if (!sockEnv || !sockEnv[0]) {
++    return;
++  }
++
++  sockaddr_un addr{};
++  if (std::strlen(sockEnv) >= sizeof(addr.sun_path)) {
++    fprintf(stderr,
++            "HeadlessStreamServer: CAMOU_HEADLESS_STREAM_SOCKET path too long\n");
++    return;
++  }
++
++  if (const char* fpsEnv = std::getenv("CAMOU_HEADLESS_STREAM_FPS")) {
++    long parsed = std::strtol(fpsEnv, nullptr, 10);
++    if (parsed >= 1 && parsed <= 120) {
++      mTargetFps = static_cast<uint32_t>(parsed);
++    }
++  }
++
++  if (const char* fmtEnv = std::getenv("CAMOU_HEADLESS_STREAM_FORMAT")) {
++    if (std::strcmp(fmtEnv, "bgra") == 0 || std::strcmp(fmtEnv, "BGRA") == 0) {
++      mFormat = RawStreamPixelFormat::BGRA;
++    }
++  }
++
++  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
++  if (fd < 0) {
++    fprintf(stderr, "HeadlessStreamServer: socket() failed: %d\n", errno);
++    return;
++  }
++
++  mSocketPath = sockEnv;
++  ::unlink(mSocketPath.c_str());
++
++  addr.sun_family = AF_UNIX;
++  std::strncpy(addr.sun_path, mSocketPath.c_str(), sizeof(addr.sun_path) - 1);
++
++  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++    fprintf(stderr, "HeadlessStreamServer: bind(%s) failed: %d\n",
++            mSocketPath.c_str(), errno);
++    ::close(fd);
++    return;
++  }
++
++  if (::listen(fd, 4) != 0) {
++    fprintf(stderr, "HeadlessStreamServer: listen(%s) failed: %d\n",
++            mSocketPath.c_str(), errno);
++    ::close(fd);
++    ::unlink(mSocketPath.c_str());
++    return;
++  }
++
++  mListenFd = fd;
++  mEnabled = true;
++  mServerThread = std::thread([this]() { ServerLoop(); });
++  mServerThread.detach();
++#endif
++}
++
++std::shared_ptr<StreamWidgetSlot> HeadlessStreamServer::RegisterWidget(
++    HeadlessCompositorWidget* aWidget) {
++  if (!mEnabled) {
++    return nullptr;
++  }
++  auto slot = std::make_shared<StreamWidgetSlot>();
++  slot->widget = aWidget;
++
++  std::lock_guard<std::mutex> lock(mWidgetsMutex);
++  mWidgets.push_back(slot);
++  return slot;
++}
++
++void HeadlessStreamServer::UnregisterWidget(
++    const std::shared_ptr<StreamWidgetSlot>& aSlot) {
++  if (!aSlot) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> slotLock(aSlot->mutex);
++    if (mActiveWidget == aSlot->widget) {
++      std::lock_guard<std::mutex> listLock(mWidgetsMutex);
++      if (mActiveWidget == aSlot->widget) {
++        mActiveWidget = nullptr;
++      }
++    }
++    aSlot->widget = nullptr;
++  }
++
++  std::lock_guard<std::mutex> listLock(mWidgetsMutex);
++  mWidgets.erase(std::remove(mWidgets.begin(), mWidgets.end(), aSlot),
++                 mWidgets.end());
++}
++
++void HeadlessStreamServer::UpdateWidgetSize(
++    const std::shared_ptr<StreamWidgetSlot>& aSlot, int32_t aWidth,
++    int32_t aHeight) {
++  if (!aSlot) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(mWidgetsMutex);
++  aSlot->width = aWidth;
++  aSlot->height = aHeight;
++}
++
++bool HeadlessStreamServer::ShouldAcceptFromWidget(
++    HeadlessCompositorWidget* aWidget, int32_t aWidth, int32_t aHeight) {
++  if (aWidth < 2 || aHeight < 2) {
++    return false;
++  }
++
++  std::lock_guard<std::mutex> lock(mWidgetsMutex);
++  bool hasPrimary = false;
++  for (const auto& slot : mWidgets) {
++    if (slot->width >= kPrimaryMinWidth && slot->height >= kPrimaryMinHeight) {
++      hasPrimary = true;
++      break;
++    }
++  }
++
++  // Skip small popup/tooltip widgets when a normal browser window exists.
++  if (hasPrimary &&
++      (aWidth < kPrimaryMinWidth || aHeight < kPrimaryMinHeight)) {
++    return false;
++  }
++
++  if (!mActiveWidget) {
++    mActiveWidget = aWidget;
++  } else if (mActiveWidget != aWidget) {
++    // Allow switching if current active widget is tiny and this one is primary.
++    bool activeIsTiny = true;
++    for (const auto& slot : mWidgets) {
++      if (slot->widget == mActiveWidget) {
++        activeIsTiny = (slot->width < kPrimaryMinWidth ||
++                        slot->height < kPrimaryMinHeight);
++        break;
++      }
++    }
++    if (activeIsTiny && aWidth >= kPrimaryMinWidth &&
++        aHeight >= kPrimaryMinHeight) {
++      mActiveWidget = aWidget;
++    }
++  }
++
++  return mActiveWidget == aWidget;
++}
++
++void HeadlessStreamServer::SubmitSurface(HeadlessCompositorWidget* aWidget,
++                                         gfx::DataSourceSurface* aSurface) {
++  if (!mEnabled || !HasClient() || !aSurface) {
++    return;
++  }
++
++  gfx::SurfaceFormat fmt = aSurface->GetFormat();
++  if (fmt != gfx::SurfaceFormat::B8G8R8A8 &&
++      fmt != gfx::SurfaceFormat::B8G8R8X8) {
++    return;
++  }
++
++  gfx::IntSize size = aSurface->GetSize();
++  if (!ShouldAcceptFromWidget(aWidget, size.width, size.height)) {
++    return;
++  }
++
++  gfx::DataSourceSurface::ScopedMap map(aSurface,
++                                        gfx::DataSourceSurface::MapType::READ);
++  if (!map.IsMapped()) {
++    return;
++  }
++
++  RawStreamPixelFormat outFmt = mFormat;
++  uint32_t outW = static_cast<uint32_t>(size.width);
++  uint32_t outH = static_cast<uint32_t>(size.height);
++
++#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++  outFmt = RawStreamPixelFormat::BGRA;
++#endif
++
++  if (outFmt == RawStreamPixelFormat::NV12) {
++    outW &= ~1u;
++    outH &= ~1u;
++    if (outW < 2 || outH < 2) {
++      return;
++    }
++  }
++
++  size_t payloadSize = 0;
++  if (outFmt == RawStreamPixelFormat::NV12) {
++    payloadSize = static_cast<size_t>(outW) * outH +
++                  static_cast<size_t>(outW) * (outH / 2);
++  } else {
++    payloadSize = static_cast<size_t>(outW) * outH * 4;
++  }
++
++  {
++    std::lock_guard<std::mutex> lock(mFrameMutex);
++    mStagingBuffer.resize(payloadSize);
++
++    if (outFmt == RawStreamPixelFormat::NV12) {
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++      uint8_t* dstY = mStagingBuffer.data();
++      uint8_t* dstUV = dstY + static_cast<size_t>(outW) * outH;
++      int rc = libyuv::ARGBToNV12(
++          map.GetData(), map.GetStride(), dstY, static_cast<int>(outW), dstUV,
++          static_cast<int>(outW), static_cast<int>(outW),
++          static_cast<int>(outH));
++      if (rc != 0) {
++        return;
++      }
++#endif
++    } else {
++      const uint32_t rowBytes = outW * 4;
++      const int32_t srcStride = map.GetStride();
++      const uint8_t* src = map.GetData();
++      uint8_t* dst = mStagingBuffer.data();
++      if (srcStride == static_cast<int32_t>(rowBytes)) {
++        std::memcpy(dst, src, payloadSize);
++      } else {
++        for (uint32_t y = 0; y < outH; ++y) {
++          std::memcpy(dst + static_cast<size_t>(y) * rowBytes,
++                      src + static_cast<size_t>(y) * srcStride, rowBytes);
++        }
++      }
++    }
++
++    mStagingHeader.magic = kStreamMagic;
++    mStagingHeader.version = kStreamVersion;
++    mStagingHeader.width = outW;
++    mStagingHeader.height = outH;
++    mStagingHeader.pixelFormat = static_cast<uint32_t>(outFmt);
++    mStagingHeader.payloadSize = static_cast<uint32_t>(payloadSize);
++    mStagingHeader.ptsUs = NowMicroseconds();
++    mHasPendingFrame = true;
++  }
++  mFrameCv.notify_one();
++}
++
++void HeadlessStreamServer::RequestInitialFrames() {
++  std::vector<std::shared_ptr<StreamWidgetSlot>> slots;
++  {
++    std::lock_guard<std::mutex> lock(mWidgetsMutex);
++    slots = mWidgets;
++  }
++  if (slots.empty()) {
++    return;
++  }
++
++  if (nsCOMPtr<nsIThread> compThread = layers::CompositorThread()) {
++    compThread->Dispatch(NS_NewRunnableFunction(
++        "HeadlessStreamServer::RequestInitialFrames",
++        [slots = std::move(slots)]() {
++          for (const auto& slot : slots) {
++            std::lock_guard<std::mutex> slotLock(slot->mutex);
++            if (slot->widget) {
++              slot->widget->EmitRawFrameIfReady(true);
++            }
++          }
++        }));
++  }
++}
++
++void HeadlessStreamServer::ServerLoop() {
++#if defined(XP_UNIX)
++  while (!mStopRequested.load(std::memory_order_acquire)) {
++    struct pollfd pfd{};
++    pfd.fd = mListenFd;
++    pfd.events = POLLIN;
++    int pr = ::poll(&pfd, 1, 250);
++    if (pr <= 0) {
++      continue;
++    }
++    if (!(pfd.revents & POLLIN)) {
++      continue;
++    }
++
++    int clientFd = ::accept(mListenFd, nullptr, nullptr);
++    if (clientFd < 0) {
++      continue;
++    }
++
++#  ifdef SO_NOSIGPIPE
++    int one = 1;
++    ::setsockopt(clientFd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++#  endif
++    struct timeval tv{};
++    tv.tv_sec = 2;
++    tv.tv_usec = 0;
++    ::setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++
++    {
++      std::lock_guard<std::mutex> lock(mFrameMutex);
++      mHasPendingFrame = false;
++    }
++    mHasClient.store(true, std::memory_order_release);
++    RequestInitialFrames();
++
++    while (!mStopRequested.load(std::memory_order_acquire)) {
++      RawStreamFrameHeader header{};
++      {
++        std::unique_lock<std::mutex> lock(mFrameMutex);
++        mFrameCv.wait_for(lock, std::chrono::milliseconds(200), [this]() {
++          return mHasPendingFrame || mStopRequested.load(std::memory_order_relaxed);
++        });
++        if (mStopRequested.load(std::memory_order_acquire)) {
++          break;
++        }
++        if (!mHasPendingFrame) {
++          // Probe peer readability/hangup with zero-cost poll so disconnects are
++          // detected promptly even while the page is static.
++          struct pollfd cpfd{};
++          cpfd.fd = clientFd;
++          cpfd.events = POLLIN;
++          int cpr = ::poll(&cpfd, 1, 0);
++          if (cpr < 0 || (cpr > 0 && (cpfd.revents & (POLLERR | POLLHUP | POLLNVAL | POLLIN)))) {
++            uint8_t drain[16];
++            if (cpr > 0 && (cpfd.revents & POLLIN)) {
++              ssize_t r = ::recv(clientFd, drain, sizeof(drain), MSG_DONTWAIT);
++              if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
++                break;
++              }
++            } else {
++              break;
++            }
++          }
++          continue;
++        }
++
++        header = mStagingHeader;
++        mSendBuffer.swap(mStagingBuffer);
++        mHasPendingFrame = false;
++      }
++
++      if (!WriteExact(clientFd, reinterpret_cast<const uint8_t*>(&header),
++                      sizeof(header))) {
++        break;
++      }
++      if (header.payloadSize > 0 &&
++          !WriteExact(clientFd, mSendBuffer.data(), header.payloadSize)) {
++        break;
++      }
++    }
++
++    mHasClient.store(false, std::memory_order_release);
++    ::close(clientFd);
++
++    // Release staging memory when no viewer is connected so idle profiles stay lean.
++    {
++      std::lock_guard<std::mutex> lock(mFrameMutex);
++      mHasPendingFrame = false;
++      std::vector<uint8_t>().swap(mStagingBuffer);
++    }
++    std::vector<uint8_t>().swap(mSendBuffer);
++  }
++#endif
++}
++
++}  // namespace widget
++}  // namespace mozilla
+diff --git a/widget/headless/HeadlessStreamServer.h b/widget/headless/HeadlessStreamServer.h
+new file mode 100644
+--- /dev/null
++++ b/widget/headless/HeadlessStreamServer.h
+@@ -0,0 +1,102 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef widget_headless_HeadlessStreamServer_h
++#define widget_headless_HeadlessStreamServer_h
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "mozilla/gfx/2D.h"
++
++namespace mozilla {
++namespace widget {
++
++class HeadlessCompositorWidget;
++
++enum class RawStreamPixelFormat : uint32_t {
++  BGRA = 1,
++  NV12 = 2,
++};
++
++struct alignas(8) RawStreamFrameHeader {
++  uint32_t magic;
++  uint32_t version;
++  uint32_t width;
++  uint32_t height;
++  uint32_t pixelFormat;
++  uint32_t payloadSize;
++  uint64_t ptsUs;
++};
++static_assert(sizeof(RawStreamFrameHeader) == 32,
++              "RawStreamFrameHeader must be 32 bytes");
++
++struct StreamWidgetSlot {
++  std::mutex mutex;
++  HeadlessCompositorWidget* widget = nullptr;
++  int32_t width = 0;
++  int32_t height = 0;
++};
++
++class HeadlessStreamServer final {
++ public:
++  static HeadlessStreamServer* Get();
++
++  bool IsEnabled() const { return mEnabled; }
++  bool HasClient() const { return mHasClient.load(std::memory_order_acquire); }
++  uint32_t TargetFps() const { return mTargetFps; }
++
++  std::shared_ptr<StreamWidgetSlot> RegisterWidget(
++      HeadlessCompositorWidget* aWidget);
++  void UnregisterWidget(const std::shared_ptr<StreamWidgetSlot>& aSlot);
++  void UpdateWidgetSize(const std::shared_ptr<StreamWidgetSlot>& aSlot,
++                        int32_t aWidth, int32_t aHeight);
++
++  // Called on CompositorThread right after SWGL finishes drawing a frame.
++  // Never blocks on socket I/O: overwrites the single latest-frame slot.
++  void SubmitSurface(HeadlessCompositorWidget* aWidget,
++                     gfx::DataSourceSurface* aSurface);
++
++ private:
++  HeadlessStreamServer();
++  ~HeadlessStreamServer() = default;
++
++  void ServerLoop();
++  void RequestInitialFrames();
++  bool ShouldAcceptFromWidget(HeadlessCompositorWidget* aWidget,
++                              int32_t aWidth, int32_t aHeight);
++
++  bool mEnabled = false;
++  uint32_t mTargetFps = 60;
++  RawStreamPixelFormat mFormat = RawStreamPixelFormat::NV12;
++  std::string mSocketPath;
++
++  std::atomic<bool> mHasClient{false};
++  std::atomic<bool> mStopRequested{false};
++  int mListenFd = -1;
++
++  std::mutex mWidgetsMutex;
++  std::vector<std::shared_ptr<StreamWidgetSlot>> mWidgets;
++  HeadlessCompositorWidget* mActiveWidget = nullptr;
++
++  std::mutex mFrameMutex;
++  std::condition_variable mFrameCv;
++  RawStreamFrameHeader mStagingHeader{};
++  std::vector<uint8_t> mStagingBuffer;
++  bool mHasPendingFrame = false;
++
++  std::vector<uint8_t> mSendBuffer;
++  std::thread mServerThread;
++};
++
++}  // namespace widget
++}  // namespace mozilla
++
++#endif  // widget_headless_HeadlessStreamServer_h
