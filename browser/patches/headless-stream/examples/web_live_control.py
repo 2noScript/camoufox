@@ -414,13 +414,19 @@ def resolve_camoufox_binary(explicit: str | None) -> Path:
         if os.environ.get(var):
             return Path(os.environ[var]).expanduser().resolve()
     browser_dir = Path(__file__).resolve().parents[3]
-    candidates = sorted(
-        list(browser_dir.glob("camoufox-*/obj-*/dist/Camoufox.app/Contents/MacOS/camoufox"))
-        + list(browser_dir.glob("camoufox-*/obj-*/dist/bin/camoufox-bin"))
+    # Prefer the macOS .app bundle executable when present; dist/bin/camoufox-bin
+    # on macOS lacks the bundled XUL framework and fails with "Couldn't load XPCOM".
+    mac_candidates = sorted(
+        browser_dir.glob("camoufox-*/obj-*/dist/Camoufox.app/Contents/MacOS/camoufox")
     )
-    if not candidates:
-        raise SystemExit("No built Camoufox binary found; pass --binary or set CAMOUFOX_EXECUTABLE_PATH")
-    return candidates[-1]
+    if mac_candidates:
+        return mac_candidates[-1]
+    linux_candidates = sorted(
+        browser_dir.glob("camoufox-*/obj-*-linux-gnu/dist/bin/camoufox-bin")
+    )
+    if linux_candidates:
+        return linux_candidates[-1]
+    raise SystemExit("No built Camoufox binary found; pass --binary or set CAMOUFOX_EXECUTABLE_PATH")
 
 
 def send_ws_binary(sock: socket.socket, payload: bytes) -> None:
