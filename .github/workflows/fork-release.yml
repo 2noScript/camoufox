@@ -17,7 +17,7 @@ on:
         required: false
         default: all
   push:
-    tags: ["v*-stream.[0-9]+"]
+    tags: ["v*-stream.*"]
 
 permissions: {}
 
