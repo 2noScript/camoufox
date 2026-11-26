@@ -1,9 +1,9 @@
 # Headless Live Stream Patch
 
 `zz-headless-live-stream.patch` exposes composited frames from `--headless`
-Firefox/Camoufox directly over a Unix domain socket (`AF_UNIX`), bypassing
-Juggler's 25 FPS timer, CPU JPEG compression, Base64 encoding, and main-thread
-roundtrips while requiring no virtual display or screen recording permissions.
+Firefox/Camoufox directly over a Unix domain socket (`AF_UNIX`) and accepts
+real widget-level mouse, wheel, and keyboard input back over the same stream,
+without needing a virtual display or screen recording permissions.
 
 This patch lives in its own directory under `browser/patches/headless-stream/`
 so no core Camoufox or Playwright patch files are modified.
@@ -25,10 +25,10 @@ Read once in the parent/GPU process (`HeadlessStreamServer::Get()`):
 While no viewer client is connected to the socket, zero frame readbacks or
 conversions occur. When a client disconnects, staging buffers are freed.
 
-## Wire Protocol
+## Video Output Wire Protocol (`CAMF`, Browser -> Client)
 
-Each frame sent over the `SOCK_STREAM` socket begins with a 32-byte
-little-endian header followed immediately by `payload_size` raw pixel bytes:
+Each frame begins with a 32-byte little-endian header followed immediately by
+`payload_size` raw pixel bytes:
 
 | Offset | Type | Field | Description |
 |---|---|---|---|
@@ -39,3 +39,26 @@ little-endian header followed immediately by `payload_size` raw pixel bytes:
 | 16 | `u32` | `pixel_format` | `1` = `BGRA` (`w * h * 4`), `2` = `NV12` (`w * h * 3 / 2`) |
 | 20 | `u32` | `payload_size` | Exact byte count following this header |
 | 24 | `u64` | `pts_us` | Monotonic steady clock timestamp in microseconds |
+
+## Reverse Input Wire Protocol (`CAMI`, Client -> Browser)
+
+The client can write 36-byte little-endian `CAMI` packets (optionally followed
+by `text_len` UTF-8 bytes) back onto the connected `SOCK_STREAM`. Events are
+dispatched on the parent process main thread against the active `HeadlessWidget`
+using `WidgetMouseEvent::eReal`, `WidgetWheelEvent` (with `mWheelTicks*`),
+`TextEventDispatcher::BeginNativeInputTransaction`, and
+`MaskConfig::InputTimeStamp()`. Coordinates `(x, y)` are in frame device pixels
+from the top-left corner of the window, covering both browser chrome (URL bar,
+tabs) and web content.
+
+| Offset | Type | Field | Description |
+|---|---|---|---|
+| 0 | `u32` | `magic` | `0x494D4143` (`"CAMI"` little-endian) |
+| 4 | `u32` | `version` | `1` |
+| 8 | `u32` | `type` | `1`=MouseMove, `2`=MouseDown, `3`=MouseUp, `4`=Wheel, `5`=KeyDown, `6`=KeyUp, `7`=UTF-8 Text |
+| 12 | `u32` | `modifiers` | Bitmask: `1`=Shift, `2`=Control, `4`=Alt, `8`=Meta |
+| 16 | `i32` | `x` | Pixel X (Mouse/Wheel), or `isRepeat` (`0`/`1`) for Key |
+| 20 | `i32` | `y` | Pixel Y (Mouse/Wheel), or `location` (`0`=auto) for Key |
+| 24 | `i32` | `button` | Mouse button `0..4`, or Wheel `deltaX` (px) |
+| 28 | `i32` | `data` | Wheel `deltaY` (px), or DOM `keyCode` (`0`=auto) |
+| 32 | `u32` | `text_len` | UTF-8 payload byte count (`"key\tcode"` for KeyDown/Up, UTF-8 string for Text) |

@@ -170,18 +170,61 @@ diff --git a/widget/headless/HeadlessCompositorWidget.h b/widget/headless/Headle
  };
  
  }  // namespace widget
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -68,6 +68,22 @@
+   return widget.forget();
+ }
+ 
++/* static */
++already_AddRefed<HeadlessWidget> HeadlessWidget::FindActiveWindow(
++    uintptr_t aWidgetKey) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (aWidgetKey && sActiveWindows) {
++    for (size_t i = sActiveWindows->Length(); i > 0; --i) {
++      HeadlessWidget* w = sActiveWindows->ElementAt(i - 1);
++      if (reinterpret_cast<uintptr_t>(w) == aWidgetKey && !w->mDestroyed) {
++        RefPtr<HeadlessWidget> ret = w;
++        return ret.forget();
++      }
++    }
++  }
++  return GetActiveWindow();
++}
++
+ HeadlessWidget::HeadlessWidget()
+     : mEnabled(true),
+       mVisible(false),
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -130,6 +130,12 @@
+   using SnapshotListener = std::function<void(RefPtr<gfx::DataSourceSurface>&&)>;
+   void SetSnapshotListener(SnapshotListener&& listener);
+ 
++  // Returns the currently active TopLevel/Dialog widget matching aWidgetKey,
++  // or the top active widget if none matches. Must be called on MainThread.
++  static already_AddRefed<HeadlessWidget> FindActiveWindow(
++      uintptr_t aWidgetKey);
++  bool IsDestroyed() const { return mDestroyed; }
++
+  private:
+   ~HeadlessWidget();
+   bool mEnabled;
 diff --git a/widget/headless/moz.build b/widget/headless/moz.build
 --- a/widget/headless/moz.build
 +++ b/widget/headless/moz.build
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@
  DIRS += ["tests"]
  
  LOCAL_INCLUDES += [
++    "/camoucfg",
 +    "/media/libyuv/libyuv/include",
      "/widget",
      "/widget/headless",
  ]
-@@ -21,6 +22,10 @@
+@@ -21,6 +23,10 @@
  EXPORTS.mozilla.widget += [
      "HeadlessCompositorWidget.h",
      "HeadlessWidget.h",
@@ -196,7 +239,7 @@ diff --git a/widget/headless/HeadlessStreamServer.cpp b/widget/headless/Headless
 new file mode 100644
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.cpp
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,766 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -205,12 +248,23 @@ new file mode 100644
 +
 +#include <algorithm>
 +#include <chrono>
++#include <cmath>
 +#include <cstdlib>
 +#include <cstring>
 +
 +#include "HeadlessCompositorWidget.h"
++#include "HeadlessWidget.h"
++#include "MaskConfig.hpp"
 +#include "libyuv.h"
++#include "mozilla/BasicEvents.h"
++#include "mozilla/MouseEvents.h"
++#include "mozilla/TextEventDispatcher.h"
++#include "mozilla/TextEventDispatcherListener.h"
++#include "mozilla/TextEvents.h"
 +#include "mozilla/layers/CompositorThread.h"
++#include "mozilla/widget/IMEData.h"
++#include "nsString.h"
++#include "nsThreadUtils.h"
 +#include "nsXULAppAPI.h"
 +
 +#if defined(XP_UNIX)
@@ -228,7 +282,9 @@ new file mode 100644
 +namespace {
 +
 +constexpr uint32_t kStreamMagic = 0x464D4143u;  // "CAMF" little-endian
++constexpr uint32_t kInputMagic = 0x494D4143u;   // "CAMI" little-endian
 +constexpr uint32_t kStreamVersion = 1u;
++constexpr uint32_t kMaxInputPayloadBytes = 65536u;
 +constexpr int32_t kPrimaryMinWidth = 200;
 +constexpr int32_t kPrimaryMinHeight = 200;
 +
@@ -252,12 +308,111 @@ new file mode 100644
 +  }
 +  return true;
 +}
++
++bool ReadExact(int aFd, uint8_t* aData, size_t aLen) {
++  size_t recvd = 0;
++  while (recvd < aLen) {
++    ssize_t n = ::recv(aFd, aData + recvd, aLen - recvd, 0);
++    if (n > 0) {
++      recvd += static_cast<size_t>(n);
++      continue;
++    }
++    if (n < 0 && errno == EINTR) {
++      continue;
++    }
++    return false;
++  }
++  return true;
++}
 +#endif
 +
 +uint64_t NowMicroseconds() {
 +  auto now = std::chrono::steady_clock::now().time_since_epoch();
 +  return static_cast<uint64_t>(
 +      std::chrono::duration_cast<std::chrono::microseconds>(now).count());
++}
++
++Modifiers ToGeckoModifiers(uint32_t aMods) {
++  Modifiers mods = MODIFIER_NONE;
++  if (aMods & (1u << 0)) mods |= MODIFIER_SHIFT;
++  if (aMods & (1u << 1)) mods |= MODIFIER_CONTROL;
++  if (aMods & (1u << 2)) mods |= MODIFIER_ALT;
++  if (aMods & (1u << 3)) mods |= MODIFIER_META;
++  return mods;
++}
++
++MouseButton ToMouseButton(int32_t aButton, uint32_t* aOutIndex) {
++  switch (aButton) {
++    case 0:
++      *aOutIndex = 0;
++      return MouseButton::ePrimary;
++    case 1:
++      *aOutIndex = 1;
++      return MouseButton::eMiddle;
++    case 2:
++      *aOutIndex = 2;
++      return MouseButton::eSecondary;
++    case 3:
++      *aOutIndex = 3;
++      return MouseButton::eX1;
++    case 4:
++      *aOutIndex = 4;
++      return MouseButton::eX2;
++    default:
++      *aOutIndex = 0;
++      return MouseButton::ePrimary;
++  }
++}
++
++uint32_t FallbackAsciiKeyCode(const nsAString& aKey) {
++  if (aKey.Length() != 1) {
++    return 0;
++  }
++  char16_t ch = aKey.CharAt(0);
++  if (ch >= u'a' && ch <= u'z') {
++    return static_cast<uint32_t>(ch - u'a' + NS_VK_A);
++  }
++  if (ch >= u'A' && ch <= u'Z') {
++    return static_cast<uint32_t>(ch - u'A' + NS_VK_A);
++  }
++  if (ch >= u'0' && ch <= u'9') {
++    return static_cast<uint32_t>(ch - u'0' + NS_VK_0);
++  }
++  if (ch == u' ') {
++    return NS_VK_SPACE;
++  }
++  return 0;
++}
++
++class StreamKeyListener final : public TextEventDispatcherListener {
++ public:
++  NS_DECL_ISUPPORTS
++
++  NS_IMETHOD NotifyIME(TextEventDispatcher*, const IMENotification&) override {
++    return NS_OK;
++  }
++  NS_IMETHOD_(IMENotificationRequests) GetIMENotificationRequests() override {
++    return {};
++  }
++  NS_IMETHOD_(void) OnRemovedFrom(TextEventDispatcher*) override {}
++  NS_IMETHOD_(void)
++  WillDispatchKeyboardEvent(TextEventDispatcher*, WidgetKeyboardEvent&,
++                            uint32_t, void*) override {}
++
++ private:
++  ~StreamKeyListener() = default;
++};
++
++NS_IMPL_ISUPPORTS(StreamKeyListener, TextEventDispatcherListener,
++                  nsISupportsWeakReference)
++
++TextEventDispatcherListener* GetStreamKeyListener() {
++  static StreamKeyListener* sListener = []() {
++    auto* p = new StreamKeyListener();
++    NS_ADDREF(p);
++    return p;
++  }();
++  return sListener;
 +}
 +
 +}  // namespace
@@ -361,6 +516,7 @@ new file mode 100644
 +      std::lock_guard<std::mutex> listLock(mWidgetsMutex);
 +      if (mActiveWidget == aSlot->widget) {
 +        mActiveWidget = nullptr;
++        mActiveWidgetKey.store(0, std::memory_order_release);
 +      }
 +    }
 +    aSlot->widget = nullptr;
@@ -405,8 +561,8 @@ new file mode 100644
 +
 +  if (!mActiveWidget) {
 +    mActiveWidget = aWidget;
++    mActiveWidgetKey.store(aWidget->GetWidgetKey(), std::memory_order_release);
 +  } else if (mActiveWidget != aWidget) {
-+    // Allow switching if current active widget is tiny and this one is primary.
 +    bool activeIsTiny = true;
 +    for (const auto& slot : mWidgets) {
 +      if (slot->widget == mActiveWidget) {
@@ -418,6 +574,7 @@ new file mode 100644
 +    if (activeIsTiny && aWidth >= kPrimaryMinWidth &&
 +        aHeight >= kPrimaryMinHeight) {
 +      mActiveWidget = aWidget;
++      mActiveWidgetKey.store(aWidget->GetWidgetKey(), std::memory_order_release);
 +    }
 +  }
 +
@@ -538,6 +695,227 @@ new file mode 100644
 +  }
 +}
 +
++void HeadlessStreamServer::ResetInputStateOnMainThread() {
++  if (!XRE_IsParentProcess()) {
++    return;
++  }
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "HeadlessStreamServer::ResetInputState", [this]() {
++        mMainInputState = MainThreadInputState{};
++      }));
++}
++
++void HeadlessStreamServer::DispatchInputOnMainThread(
++    RawStreamInputPacket aPacket, std::string aPayload) {
++  if (!XRE_IsParentProcess()) {
++    return;
++  }
++  uintptr_t widgetKey = mActiveWidgetKey.load(std::memory_order_acquire);
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "HeadlessStreamServer::DispatchInput",
++      [this, widgetKey, pkt = aPacket, payload = std::move(aPayload)]() {
++        RefPtr<HeadlessWidget> widget =
++            HeadlessWidget::FindActiveWindow(widgetKey);
++        if (!widget || widget->IsDestroyed()) {
++          return;
++        }
++
++        const Modifiers mods = ToGeckoModifiers(pkt.modifiers);
++        const LayoutDeviceIntPoint pt(pkt.x, pkt.y);
++        const RawInputType type = static_cast<RawInputType>(pkt.type);
++
++        switch (type) {
++          case RawInputType::MouseMove: {
++            WidgetMouseEvent event(true, eMouseMove, widget.get(),
++                                   WidgetMouseEvent::eReal);
++            event.mRefPoint = pt;
++            event.mButtons = mMainInputState.buttons;
++            event.mModifiers = mods;
++            event.mTimeStamp = MaskConfig::InputTimeStamp();
++            widget->DispatchInputEvent(&event);
++            break;
++          }
++          case RawInputType::MouseDown: {
++            uint32_t idx = 0;
++            MouseButton btn = ToMouseButton(pkt.button, &idx);
++            mMainInputState.buttons |= MouseButtonsFlagToChange(btn);
++
++            const mozilla::TimeStamp now = mozilla::TimeStamp::Now();
++            bool isMulti = false;
++            if (!mMainInputState.lastDownTime[idx].IsNull()) {
++              double dtMs =
++                  (now - mMainInputState.lastDownTime[idx]).ToMilliseconds();
++              if (dtMs <= 500.0 &&
++                  std::abs(pt.x - mMainInputState.lastDownX[idx]) <= 4 &&
++                  std::abs(pt.y - mMainInputState.lastDownY[idx]) <= 4) {
++                isMulti = true;
++              }
++            }
++            mMainInputState.clickCount[idx] =
++                isMulti ? std::min(mMainInputState.clickCount[idx] + 1u, 3u)
++                        : 1u;
++            mMainInputState.lastDownTime[idx] = now;
++            mMainInputState.lastDownX[idx] = pt.x;
++            mMainInputState.lastDownY[idx] = pt.y;
++
++            WidgetMouseEvent event(true, eMouseDown, widget.get(),
++                                   WidgetMouseEvent::eReal);
++            event.mRefPoint = pt;
++            event.mButton = btn;
++            event.mButtons = mMainInputState.buttons;
++            event.mModifiers = mods;
++            event.mClickCount = mMainInputState.clickCount[idx];
++            event.mTimeStamp = MaskConfig::InputTimeStamp();
++            widget->DispatchInputEvent(&event);
++            break;
++          }
++          case RawInputType::MouseUp: {
++            uint32_t idx = 0;
++            MouseButton btn = ToMouseButton(pkt.button, &idx);
++            mMainInputState.buttons &= ~MouseButtonsFlagToChange(btn);
++
++            WidgetMouseEvent event(true, eMouseUp, widget.get(),
++                                   WidgetMouseEvent::eReal);
++            event.mRefPoint = pt;
++            event.mButton = btn;
++            event.mButtons = mMainInputState.buttons;
++            event.mModifiers = mods;
++            event.mClickCount = std::max(1u, mMainInputState.clickCount[idx]);
++            event.mTimeStamp = MaskConfig::InputTimeStamp();
++            widget->DispatchInputEvent(&event);
++
++            if (btn == MouseButton::eSecondary) {
++              WidgetPointerEvent ctxEvent(true, eContextMenu, widget.get());
++              ctxEvent.mRefPoint = pt;
++              ctxEvent.mButton = MouseButton::eSecondary;
++              ctxEvent.mButtons = mMainInputState.buttons;
++              ctxEvent.mModifiers = mods;
++              ctxEvent.mClickCount = 1;
++              ctxEvent.mTimeStamp = MaskConfig::InputTimeStamp();
++              widget->DispatchInputEvent(&ctxEvent);
++            }
++            break;
++          }
++          case RawInputType::Wheel: {
++            WidgetWheelEvent event(true, eWheel, widget.get());
++            event.mDeltaMode = 0;  // DOM_DELTA_PIXEL
++            event.mDeltaX = static_cast<double>(pkt.button);
++            event.mDeltaY = static_cast<double>(pkt.data);
++            event.mLineOrPageDeltaX =
++                static_cast<int32_t>(std::lround(event.mDeltaX / 33.0));
++            event.mLineOrPageDeltaY =
++                static_cast<int32_t>(std::lround(event.mDeltaY / 33.0));
++            event.mWheelTicksX = event.mDeltaX / 120.0;
++            event.mWheelTicksY = event.mDeltaY / 120.0;
++            event.mIsNoLineOrPageDelta = false;
++            event.mRefPoint = pt;
++            event.mButtons = mMainInputState.buttons;
++            event.mModifiers = mods;
++            event.mTimeStamp = MaskConfig::InputTimeStamp();
++            widget->DispatchInputEvent(&event);
++            break;
++          }
++          case RawInputType::KeyDown:
++          case RawInputType::KeyUp: {
++            const bool isDown = (type == RawInputType::KeyDown);
++            const size_t sep = payload.find('\t');
++            std::string keyUtf8 =
++                sep == std::string::npos ? payload : payload.substr(0, sep);
++            std::string codeUtf8 =
++                sep == std::string::npos ? std::string() : payload.substr(sep + 1);
++
++            NS_ConvertUTF8toUTF16 keyStr(keyUtf8.c_str(), keyUtf8.size());
++            NS_ConvertUTF8toUTF16 codeStr(codeUtf8.c_str(), codeUtf8.size());
++
++            WidgetKeyboardEvent event(true, isDown ? eKeyDown : eKeyUp,
++                                      widget.get());
++            event.mTimeStamp = MaskConfig::InputTimeStamp();
++            event.mModifiers = mods;
++            event.mIsRepeat = isDown && (pkt.x != 0);
++            event.mCodeNameIndex =
++                WidgetKeyboardEvent::GetCodeNameIndex(codeStr);
++            event.mKeyNameIndex = WidgetKeyboardEvent::GetKeyNameIndex(keyStr);
++            if (event.mKeyNameIndex == KEY_NAME_INDEX_USE_STRING) {
++              event.mKeyValue = keyStr;
++            }
++            event.mLocation =
++                pkt.y ? static_cast<uint32_t>(pkt.y)
++                      : WidgetKeyboardEvent::ComputeLocationFromCodeValue(
++                            event.mCodeNameIndex);
++            if (pkt.data > 0) {
++              event.mKeyCode = static_cast<uint32_t>(pkt.data);
++            } else if (event.mKeyNameIndex > KEY_NAME_INDEX_Unidentified &&
++                       event.mKeyNameIndex < KEY_NAME_INDEX_USE_STRING) {
++              event.mKeyCode =
++                  WidgetKeyboardEvent::ComputeKeyCodeFromKeyNameIndex(
++                      event.mKeyNameIndex);
++            } else {
++              event.mKeyCode = FallbackAsciiKeyCode(keyStr);
++            }
++            (void)widget->AttachNativeKeyEvent(event);
++
++            if (RefPtr<TextEventDispatcher> dispatcher =
++                    widget->GetTextEventDispatcher()) {
++              if (NS_SUCCEEDED(
++                      dispatcher->BeginInputTransaction(GetStreamKeyListener()))) {
++                nsEventStatus status = nsEventStatus_eIgnore;
++                if (dispatcher->DispatchKeyboardEvent(
++                        isDown ? eKeyDown : eKeyUp, event, status)) {
++                  if (isDown && status != nsEventStatus_eConsumeNoDefault) {
++                    dispatcher->MaybeDispatchKeypressEvents(event, status);
++                  }
++                }
++              }
++            }
++            break;
++          }
++          case RawInputType::Text: {
++            if (payload.empty()) {
++              break;
++            }
++            NS_ConvertUTF8toUTF16 textStr(payload.c_str(), payload.size());
++            if (RefPtr<TextEventDispatcher> dispatcher =
++                    widget->GetTextEventDispatcher()) {
++              if (NS_SUCCEEDED(
++                      dispatcher->BeginInputTransaction(GetStreamKeyListener()))) {
++                nsEventStatus status = nsEventStatus_eIgnore;
++                dispatcher->CommitComposition(status, &textStr);
++              }
++            }
++            break;
++          }
++        }
++      }));
++}
++
++void HeadlessStreamServer::InputReaderLoop(
++    int aClientFd, std::atomic<bool>& aClientDisconnected) {
++#if defined(XP_UNIX)
++  while (!mStopRequested.load(std::memory_order_acquire) &&
++         !aClientDisconnected.load(std::memory_order_acquire)) {
++    RawStreamInputPacket pkt{};
++    if (!ReadExact(aClientFd, reinterpret_cast<uint8_t*>(&pkt), sizeof(pkt))) {
++      break;
++    }
++    if (pkt.magic != kInputMagic || pkt.version != kStreamVersion ||
++        pkt.textLen > kMaxInputPayloadBytes) {
++      break;
++    }
++    std::string payload;
++    if (pkt.textLen > 0) {
++      payload.resize(pkt.textLen);
++      if (!ReadExact(aClientFd, reinterpret_cast<uint8_t*>(payload.data()),
++                     pkt.textLen)) {
++        break;
++      }
++    }
++    DispatchInputOnMainThread(pkt, std::move(payload));
++  }
++  aClientDisconnected.store(true, std::memory_order_release);
++  mFrameCv.notify_all();
++#endif
++}
++
 +void HeadlessStreamServer::ServerLoop() {
 +#if defined(XP_UNIX)
 +  while (!mStopRequested.load(std::memory_order_acquire)) {
@@ -545,10 +923,7 @@ new file mode 100644
 +    pfd.fd = mListenFd;
 +    pfd.events = POLLIN;
 +    int pr = ::poll(&pfd, 1, 250);
-+    if (pr <= 0) {
-+      continue;
-+    }
-+    if (!(pfd.revents & POLLIN)) {
++    if (pr <= 0 || !(pfd.revents & POLLIN)) {
 +      continue;
 +    }
 +
@@ -570,37 +945,30 @@ new file mode 100644
 +      std::lock_guard<std::mutex> lock(mFrameMutex);
 +      mHasPendingFrame = false;
 +    }
++    ResetInputStateOnMainThread();
++    std::atomic<bool> clientDisconnected{false};
++    std::thread inputThread([this, clientFd, &clientDisconnected]() {
++      InputReaderLoop(clientFd, clientDisconnected);
++    });
++
 +    mHasClient.store(true, std::memory_order_release);
 +    RequestInitialFrames();
 +
-+    while (!mStopRequested.load(std::memory_order_acquire)) {
++    while (!mStopRequested.load(std::memory_order_acquire) &&
++           !clientDisconnected.load(std::memory_order_acquire)) {
 +      RawStreamFrameHeader header{};
 +      {
 +        std::unique_lock<std::mutex> lock(mFrameMutex);
-+        mFrameCv.wait_for(lock, std::chrono::milliseconds(200), [this]() {
-+          return mHasPendingFrame || mStopRequested.load(std::memory_order_relaxed);
++        mFrameCv.wait_for(lock, std::chrono::milliseconds(200), [&]() {
++          return mHasPendingFrame ||
++                 clientDisconnected.load(std::memory_order_relaxed) ||
++                 mStopRequested.load(std::memory_order_relaxed);
 +        });
-+        if (mStopRequested.load(std::memory_order_acquire)) {
++        if (mStopRequested.load(std::memory_order_acquire) ||
++            clientDisconnected.load(std::memory_order_acquire)) {
 +          break;
 +        }
 +        if (!mHasPendingFrame) {
-+          // Probe peer readability/hangup with zero-cost poll so disconnects are
-+          // detected promptly even while the page is static.
-+          struct pollfd cpfd{};
-+          cpfd.fd = clientFd;
-+          cpfd.events = POLLIN;
-+          int cpr = ::poll(&cpfd, 1, 0);
-+          if (cpr < 0 || (cpr > 0 && (cpfd.revents & (POLLERR | POLLHUP | POLLNVAL | POLLIN)))) {
-+            uint8_t drain[16];
-+            if (cpr > 0 && (cpfd.revents & POLLIN)) {
-+              ssize_t r = ::recv(clientFd, drain, sizeof(drain), MSG_DONTWAIT);
-+              if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-+                break;
-+              }
-+            } else {
-+              break;
-+            }
-+          }
 +          continue;
 +        }
 +
@@ -620,9 +988,12 @@ new file mode 100644
 +    }
 +
 +    mHasClient.store(false, std::memory_order_release);
++    clientDisconnected.store(true, std::memory_order_release);
++    ::shutdown(clientFd, SHUT_RDWR);
++    inputThread.join();
 +    ::close(clientFd);
++    ResetInputStateOnMainThread();
 +
-+    // Release staging memory when no viewer is connected so idle profiles stay lean.
 +    {
 +      std::lock_guard<std::mutex> lock(mFrameMutex);
 +      mHasPendingFrame = false;
@@ -639,7 +1010,7 @@ diff --git a/widget/headless/HeadlessStreamServer.h b/widget/headless/HeadlessSt
 new file mode 100644
 --- /dev/null
 +++ b/widget/headless/HeadlessStreamServer.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,144 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -656,6 +1027,7 @@ new file mode 100644
 +#include <thread>
 +#include <vector>
 +
++#include "mozilla/TimeStamp.h"
 +#include "mozilla/gfx/2D.h"
 +
 +namespace mozilla {
@@ -679,6 +1051,30 @@ new file mode 100644
 +};
 +static_assert(sizeof(RawStreamFrameHeader) == 32,
 +              "RawStreamFrameHeader must be 32 bytes");
++
++enum class RawInputType : uint32_t {
++  MouseMove = 1,
++  MouseDown = 2,
++  MouseUp = 3,
++  Wheel = 4,
++  KeyDown = 5,
++  KeyUp = 6,
++  Text = 7,
++};
++
++struct alignas(4) RawStreamInputPacket {
++  uint32_t magic;      // 0x494D4143 ('C','A','M','I')
++  uint32_t version;    // 1
++  uint32_t type;       // RawInputType
++  uint32_t modifiers;  // bit0=Shift, bit1=Control, bit2=Alt, bit3=Meta
++  int32_t x;           // pixels (Mouse/Wheel), or isRepeat (Key)
++  int32_t y;           // pixels (Mouse/Wheel), or location (Key)
++  int32_t button;      // Mouse button 0..4, or Wheel deltaX
++  int32_t data;        // Wheel deltaY, or DOM keyCode
++  uint32_t textLen;    // Optional UTF-8 payload byte length
++};
++static_assert(sizeof(RawStreamInputPacket) == 36,
++              "RawStreamInputPacket must be 36 bytes");
 +
 +struct StreamWidgetSlot {
 +  std::mutex mutex;
@@ -710,7 +1106,20 @@ new file mode 100644
 +  HeadlessStreamServer();
 +  ~HeadlessStreamServer() = default;
 +
++  struct MainThreadInputState {
++    int16_t buttons = 0;
++    mozilla::TimeStamp lastDownTime[5];
++    int32_t lastDownX[5] = {};
++    int32_t lastDownY[5] = {};
++    uint32_t clickCount[5] = {};
++  };
++
 +  void ServerLoop();
++  void InputReaderLoop(int aClientFd,
++                       std::atomic<bool>& aClientDisconnected);
++  void DispatchInputOnMainThread(RawStreamInputPacket aPacket,
++                                 std::string aPayload);
++  void ResetInputStateOnMainThread();
 +  void RequestInitialFrames();
 +  bool ShouldAcceptFromWidget(HeadlessCompositorWidget* aWidget,
 +                              int32_t aWidth, int32_t aHeight);
@@ -727,6 +1136,10 @@ new file mode 100644
 +  std::mutex mWidgetsMutex;
 +  std::vector<std::shared_ptr<StreamWidgetSlot>> mWidgets;
 +  HeadlessCompositorWidget* mActiveWidget = nullptr;
++  std::atomic<uintptr_t> mActiveWidgetKey{0};
++
++  // Accessed exclusively on MainThread inside DispatchInputOnMainThread / Reset.
++  MainThreadInputState mMainInputState;
 +
 +  std::mutex mFrameMutex;
 +  std::condition_variable mFrameCv;

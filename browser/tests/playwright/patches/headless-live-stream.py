@@ -1,20 +1,15 @@
 """
 Verify HeadlessStreamServer streams live compositor frames from `--headless`
-over CAMOU_HEADLESS_STREAM_SOCKET without needing a virtual display.
-
-What PASS means:
-  * Bare `-headless` with CAMOU_HEADLESS_STREAM_SOCKET binds the Unix socket and
-    stays idle until a viewer connects.
-  * Connecting a viewer receives valid 32-byte `CAMF` v1 NV12 frames with
-    monotonic pts_us, matching payload size, and distinct pixel hashes across
-    a requestAnimationFrame animation.
-  * Disconnecting and reconnecting on the same running browser resumes delivery.
+over CAMOU_HEADLESS_STREAM_SOCKET and accepts 2-way `CAMI` input back into
+HeadlessWidget with anti-detect parity (`isTrusted`, double-click detail,
+native wheel ticks, keyboard typing).
 
     python3 browser/tests/playwright/patches/headless-live-stream.py --binary ...
 """
 
 import hashlib
 import http.server
+import json
 import os
 import shutil
 import socket
@@ -33,16 +28,33 @@ from helpers import resolve_binary  # noqa: E402
 HEADER_FMT = "<IIIIIIQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MAGIC = 0x464D4143
+CAMI_FMT = "<IIIIiiiiI"
+CAMI_MAGIC = 0x494D4143
 FMT_NV12 = 2
 LOAD_TIMEOUT_S = 30.0
 STREAM_WINDOW_S = 2.0
 
 PAGE = b"""<!doctype html><meta charset=utf-8><title>headless-stream</title>
-<body style="margin:0;background:#111;overflow:hidden">
+<body style="margin:0;background:#0f172a;overflow:hidden">
+<input id="inp" style="position:fixed;inset:0;width:100vw;height:100vh;opacity:0.01;z-index:2" />
 <canvas id="c" width="800" height="500"></canvas>
 <script>
 const ctx = document.getElementById('c').getContext('2d');
+const inp = document.getElementById('inp');
 let n = 0;
+const report = (kind, payload) =>
+  fetch('/event', {method: 'POST', body: JSON.stringify({kind, ...payload})}).catch(() => {});
+
+inp.addEventListener('dblclick', (e) => {
+  report('dblclick', {trusted: e.isTrusted, detail: e.detail});
+});
+window.addEventListener('wheel', (e) => {
+  report('wheel', {trusted: e.isTrusted, wheelDelta: e.wheelDelta, deltaY: e.deltaY});
+});
+inp.addEventListener('input', (e) => {
+  report('input', {trusted: e.isTrusted, value: e.target.value});
+});
+
 function tick() {
   n++;
   ctx.fillStyle = '#0f172a';
@@ -60,6 +72,10 @@ requestAnimationFrame(tick);
 
 
 def serve_page():
+    events = []
+    ev_lock = threading.Lock()
+    ev_signal = threading.Event()
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -68,13 +84,22 @@ def serve_page():
             self.end_headers()
             self.wfile.write(PAGE)
 
+        def do_POST(self):
+            ln = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(ln)
+            with ev_lock:
+                events.append(json.loads(body))
+            ev_signal.set()
+            self.send_response(200)
+            self.end_headers()
+
         def log_message(self, *args):
             pass
 
     socketserver.TCPServer.allow_reuse_address = True
     srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, srv.server_address[1]
+    return srv, srv.server_address[1], events, ev_lock, ev_signal
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -96,6 +121,13 @@ def read_frame(sock: socket.socket):
         raise AssertionError(f"invalid header: magic={magic:#x} version={version}")
     payload = recv_exact(sock, payload_size)
     return width, height, fmt, payload, pts_us
+
+
+def send_input(sock: socket.socket, typ: int, mods: int = 0, x: int = 0, y: int = 0,
+               button: int = 0, data: int = 0, text: str = "") -> None:
+    tb = text.encode("utf-8")
+    pkt = struct.pack(CAMI_FMT, CAMI_MAGIC, 1, typ, mods, x, y, button, data, len(tb))
+    sock.sendall(pkt + tb)
 
 
 def nv12_to_png(width: int, height: int, payload: bytes, out_path: Path) -> None:
@@ -155,7 +187,7 @@ def main() -> int:
         dump_png = Path(sys.argv[sys.argv.index("--dump-png") + 1])
 
     binary = resolve_binary()
-    srv, port = serve_page()
+    srv, port, events, ev_lock, ev_signal = serve_page()
     profile = tempfile.mkdtemp(prefix="headless-stream-prof-")
     sock_dir = tempfile.mkdtemp(prefix="hs-", dir="/tmp")
     sock_path = os.path.join(sock_dir, "s.sock")
@@ -208,7 +240,7 @@ def main() -> int:
             assert first_w >= 200 and first_h >= 200, f"tiny size {first_w}x{first_h}"
             assert len(first_payload) == first_w * first_h * 3 // 2
 
-            # Give animation a moment to warm up, then sample STREAM_WINDOW_S.
+            # Sample live video stream.
             t_start = time.monotonic()
             prev_pts = first_pts
             while time.monotonic() - t_start < STREAM_WINDOW_S:
@@ -219,6 +251,42 @@ def main() -> int:
                 prev_pts = pts_us
                 frames.append((w, h, pts_us, payload))
                 hashes.add(hashlib.blake2b(payload, digest_size=8).digest())
+
+            # Exercise 2-way interactive input: double-click center, wheel down, type "ok".
+            cx, cy = first_w // 2, first_h // 2
+            send_input(client, 1, x=cx, y=cy)
+            for _ in range(2):
+                send_input(client, 2, x=cx, y=cy, button=0)
+                send_input(client, 3, x=cx, y=cy, button=0)
+            send_input(client, 4, x=cx, y=cy, button=0, data=120)
+            for ch, code in (("o", "KeyO"), ("k", "KeyK")):
+                send_input(client, 5, text=f"{ch}\t{code}")
+                send_input(client, 6, text=f"{ch}\t{code}")
+
+            # Wait briefly while pumping frames so input round-trips through Firefox.
+            input_deadline = time.monotonic() + 5.0
+            while time.monotonic() < input_deadline:
+                read_frame(client)
+                with ev_lock:
+                    kinds = {e["kind"] for e in events}
+                if {"dblclick", "wheel", "input"}.issubset(kinds):
+                    break
+
+        with ev_lock:
+            observed = list(events)
+
+        dbl = [e for e in observed if e["kind"] == "dblclick"]
+        whl = [e for e in observed if e["kind"] == "wheel"]
+        inp = [e for e in observed if e["kind"] == "input"]
+        if not dbl or not dbl[-1]["trusted"] or dbl[-1]["detail"] != 2:
+            print(f"FAIL: bad dblclick events: {dbl}")
+            return 1
+        if not whl or not whl[-1]["trusted"] or whl[-1]["wheelDelta"] != -120:
+            print(f"FAIL: bad wheel events (expected wheelDelta=-120): {whl}")
+            return 1
+        if not inp or not inp[-1]["trusted"] or inp[-1]["value"] != "ok":
+            print(f"FAIL: bad keyboard input events (expected 'ok'): {inp}")
+            return 1
 
         elapsed = max(1e-3, (frames[-1][2] - first_pts) / 1_000_000.0) if frames else 0.0
         fps = len(frames) / elapsed if elapsed > 0 else 0.0
@@ -243,7 +311,8 @@ def main() -> int:
         print(
             f"PASS: headless NV12 stream {frames[-1][0]}x{frames[-1][1]}, "
             f"{len(frames)} frames in {elapsed:.2f}s ({fps:.1f} FPS), "
-            f"{len(hashes)} distinct frames, reconnect OK"
+            f"{len(hashes)} distinct frames, 2-way input (dblclick detail=2, "
+            f"wheelDelta=-120, input='ok', all isTrusted=True), reconnect OK"
         )
         return 0
     finally:
