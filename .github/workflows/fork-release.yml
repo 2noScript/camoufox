@@ -44,6 +44,7 @@ jobs:
       digest: ${{ steps.meta.outputs.digest }}
       browser_tag: ${{ steps.meta.outputs.browser_tag }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
+      matrix: ${{ steps.meta.outputs.matrix }}
       sha: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -63,11 +64,12 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag || '' }}
           INPUT_PRE: ${{ inputs.prerelease || 'false' }}
+          INPUT_TARGETS: ${{ inputs.targets || 'all' }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           python3 - <<'EOF'
-          import os, re, subprocess
+          import json, os, re, subprocess
           from ci._util import read_upstream_sh, set_output
           from ci.browser_inputs import source_digest
 
@@ -87,9 +89,27 @@ jobs:
           if not re.match(r"^v[^-]+-[a-z]+\.\d+$", tag):
               raise SystemExit(f"Invalid browser tag {tag!r}; expected v<version>-<prefix>.<n>")
 
+          all_targets = [
+              ("linux", "x86_64"),
+              ("linux", "arm64"),
+              ("windows", "x86_64"),
+              ("macos", "x86_64"),
+              ("macos", "arm64"),
+          ]
+          raw_targets = os.environ["INPUT_TARGETS"].strip()
+          if not raw_targets or raw_targets.lower() == "all":
+              selected = all_targets
+          else:
+              wanted = {t.strip() for t in raw_targets.split(",") if t.strip()}
+              selected = [(t, a) for t, a in all_targets if f"{t}-{a}" in wanted]
+              if not selected:
+                  raise SystemExit(f"No matching targets in {raw_targets!r}")
+
+          matrix = {"include": [{"target": t, "arch": a} for t, a in selected]}
           set_output("digest", source_digest())
           set_output("browser_tag", tag)
           set_output("prerelease", "true" if os.environ["INPUT_PRE"].lower() == "true" else "false")
+          set_output("matrix", json.dumps(matrix))
           EOF
 
   build-browser:
@@ -102,20 +122,7 @@ jobs:
       CAMOUFOX_UBO: ${{ needs.prepare.outputs.ubo }}
     strategy:
       fail-fast: false
-      matrix:
-        target: [linux, windows, macos]
-        arch: [x86_64, arm64, i686]
-        exclude:
-          - target: windows
-            arch: arm64
-          - target: macos
-            arch: i686
-          - target: linux
-            arch: i686
-    if: >-
-      github.event_name == 'push' ||
-      (inputs.targets || 'all') == 'all' ||
-      contains(format(',{0},', inputs.targets), format(',{0}-{1},', matrix.target, matrix.arch))
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
